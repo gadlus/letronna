@@ -31,14 +31,24 @@ pub struct Session {
 }
 
 /// What of `messages` is shared: what was asked and each reply with text,
-/// not notices, tool calls or their output.
+/// not notices, tool calls or their output, with any key or token in them
+/// hidden, as a pasted one would otherwise go out with the link.
 pub fn kept(messages: &[Message]) -> Vec<Shared> {
+    let secrets = crate::redact::secrets();
+    let hide = |text: &str| {
+        crate::redact::hide(
+            text,
+            &secrets,
+            crate::redact::Shapes::Vendor,
+            crate::redact::MARKER,
+        )
+    };
     (messages.iter())
         .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
         .filter(|m| !m.notice && !m.content.trim().is_empty())
         .map(|m| Shared {
             role: m.role.clone(),
-            content: m.content.clone(),
+            content: hide(&m.content),
             model: m.model.clone(),
         })
         .collect()

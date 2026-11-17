@@ -51,7 +51,7 @@ pub(crate) fn page(title: &str, messages: &[Message]) -> String {
         body.push_str(&format!(
             "<section class=\"{class}\"><p class=\"who\">{}</p>{}</section>\n",
             escape(&who),
-            markdown::to_html(&m.content)
+            markdown::to_html(&letronna_core::redact::mask(&m.content))
         ));
     }
     flush(&mut body, &mut steps);

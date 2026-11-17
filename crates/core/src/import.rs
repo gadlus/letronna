@@ -211,6 +211,10 @@ fn head(tool: Tool, path: &Path) -> (String, String, Option<PathBuf>) {
 /// Read `candidate`'s file in full and turn it into messages this app knows
 /// how to save.
 pub fn import(candidate: &Candidate) -> Result<Imported, String> {
+    read_whole(candidate).map(masked)
+}
+
+fn read_whole(candidate: &Candidate) -> Result<Imported, String> {
     match candidate.tool {
         Tool::ClaudeCode => import_claude_code(&candidate.path),
         Tool::Codex => import_codex(&candidate.path),
@@ -223,6 +227,30 @@ pub fn import(candidate: &Candidate) -> Result<Imported, String> {
         Tool::Kiro => kiro::import(&candidate.path),
         Tool::Hermes => hermes::import(&candidate.path, &candidate.session_id),
     }
+}
+
+/// `imported` with every key and token in it hidden: what was pasted, a
+/// printed `.env`, a bearer token in a command. Old transcripts were never
+/// scrubbed the way Letronna's own tool results are (`redact`), and an
+/// imported session is sent to a model, and may be shared, like any other.
+fn masked(mut imported: Imported) -> Imported {
+    let secrets = crate::redact::secrets();
+    let hide = |text: &str| {
+        crate::redact::hide(
+            text,
+            &secrets,
+            crate::redact::Shapes::Vendor,
+            crate::redact::MARKER,
+        )
+    };
+    for m in &mut imported.messages {
+        m.content = hide(&m.content);
+        m.reasoning = hide(&m.reasoning);
+        for call in &mut m.tool_calls {
+            call.arguments = hide(&call.arguments);
+        }
+    }
+    imported
 }
 
 /// The sessions in a file named directly, as `/import <path>` takes: one,
@@ -436,6 +464,7 @@ fn claude_code_head(path: &Path) -> (String, Option<PathBuf>) {
         if title.is_empty()
             && record["type"].as_str() == Some("user")
             && record["isMeta"].as_bool() != Some(true)
+            && record["isCompactSummary"].as_bool() != Some(true)
         {
             let text = claude_user_text(&record["message"]["content"]);
             if !text.trim().is_empty() && !injected(&text) && !reports(&text) {
@@ -514,6 +543,25 @@ fn claude_user_record(
     skipped: &mut usize,
 ) {
     let content = &record["message"]["content"];
+    // Claude Code's summary of the turns it compacted: written as the user's
+    // turn, but Claude Code's words, so kept as a notice the model still reads.
+    if record["isCompactSummary"].as_bool() == Some(true) {
+        let text = match content.as_str() {
+            Some(text) => text.to_owned(),
+            None => claude_user_text(content),
+        };
+        if text.trim().is_empty() {
+            *skipped += 1;
+        } else {
+            messages.push(Message {
+                role: "user".into(),
+                content: text,
+                notice: true,
+                ..Default::default()
+            });
+        }
+        return;
+    }
     if let Some(text) = content.as_str() {
         if text.trim().is_empty() {
             *skipped += 1;
@@ -881,11 +929,13 @@ fn codex_response_item(
             };
             let text = codex_output_text(&payload["output"]);
             let name = call_names.get(id).cloned().unwrap_or_default();
+            let failed = codex_failed(&payload["output"]);
             messages.push(Message {
                 role: "tool".into(),
                 content: keep_ends(text, MAX_TOOL_CHARS, ""),
                 tool_call_id: id.to_owned(),
                 name,
+                is_error: failed,
                 ..Default::default()
             });
         }
@@ -946,6 +996,32 @@ fn codex_content_text(content: &Value) -> String {
 /// A tool output: a plain string, or an array of content items in the same
 /// shape as a message's, joined; anything else is kept as its raw JSON
 /// rather than lost.
+/// Whether a Codex tool output says its call failed. Codex keeps no flag
+/// for it: a command's output is either JSON with `metadata.exit_code`, or
+/// text that opens `Exit code: N`; another tool's may carry `success`.
+fn codex_failed(output: &Value) -> bool {
+    let parsed;
+    let output = match output.as_str() {
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) if value.is_object() => {
+                parsed = value;
+                &parsed
+            }
+            _ => {
+                return (text.trim_start().strip_prefix("Exit code:"))
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|code| code.parse::<i64>().ok())
+                    .is_some_and(|code| code != 0);
+            }
+        },
+        None => output,
+    };
+    output["success"].as_bool() == Some(false)
+        || output["metadata"]["exit_code"]
+            .as_i64()
+            .is_some_and(|code| code != 0)
+}
+
 fn codex_output_text(output: &Value) -> String {
     if let Some(text) = output.as_str() {
         return text.to_owned();
@@ -1381,6 +1457,89 @@ mod tests {
         assert_eq!(messages[2].content, "fn login() {}");
         assert!(!messages[2].is_error);
         assert_eq!(messages[3].content, "Fixed it.");
+    }
+
+    #[test]
+    fn claude_codes_compaction_summary_comes_in_as_a_notice_not_as_you() {
+        let dir = scratch("claude-compact");
+        let path = write(
+            &dir,
+            "c1.jsonl",
+            concat!(
+                r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued. Summary: fixing login."}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"Carry on"}}"#,
+                "\n",
+            ),
+        );
+        let imported = import_claude_code(&path).unwrap();
+        assert!(imported.messages[0].notice);
+        assert!(
+            imported.messages[0]
+                .content
+                .contains("Summary: fixing login")
+        );
+        assert!(!imported.messages[1].notice);
+        assert_eq!(imported.title, "Carry on");
+        assert_eq!(claude_code_head(&path).0, "Carry on");
+    }
+
+    #[test]
+    fn a_failed_codex_call_is_marked_failed() {
+        for (output, failed) in [
+            (
+                serde_json::json!("Exit code: 1\nWall time: 0.1 seconds\nOutput:\nno such file"),
+                true,
+            ),
+            (serde_json::json!("Exit code: 0\nOutput:\nok"), false),
+            (
+                serde_json::json!(r#"{"output":"boom","metadata":{"exit_code":2}}"#),
+                true,
+            ),
+            (
+                serde_json::json!(r#"{"output":"fine","metadata":{"exit_code":0}}"#),
+                false,
+            ),
+            (
+                serde_json::json!({"success": false, "content": "denied"}),
+                true,
+            ),
+            (serde_json::json!("app.py\nREADME.md"), false),
+        ] {
+            assert_eq!(codex_failed(&output), failed, "{output}");
+        }
+    }
+
+    #[test]
+    fn keys_in_an_imported_session_are_hidden() {
+        let key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdEFGH";
+        let imported = masked(Imported {
+            source: Source {
+                tool: Tool::ClaudeCode,
+                session_id: "s".into(),
+                path: PathBuf::new(),
+            },
+            title: String::new(),
+            workspace: None,
+            updated: 0,
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: format!("use {key}"),
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    content: format!("OPENAI_API_KEY={key}\n"),
+                    ..Default::default()
+                },
+            ],
+            skipped: 0,
+        });
+        for m in &imported.messages {
+            assert!(!m.content.contains(key), "{}", m.content);
+            assert!(m.content.contains(crate::redact::MARKER));
+        }
     }
 
     const CODEX_FIXTURE: &str = concat!(

@@ -149,6 +149,12 @@ pub(crate) fn scrub(text: &str, shapes: bool) -> String {
     hide(text, &secrets(), shapes, MARKER)
 }
 
+/// `text` with the user's keys and anything shaped like a secret hidden, for
+/// what leaves Letronna as a page or a file the user makes to pass on.
+pub fn mask(text: &str) -> String {
+    scrub(text, true)
+}
+
 /// `text`, cut from something longer at either end, scrubbed as `scrub`
 /// does, with what the cut left of a saved value at either end hidden too,
 /// and with `shapes` the start of a vendor's key the end cut short.

@@ -95,7 +95,7 @@ pub mod profiles;
 pub mod prompt_rules;
 pub mod providers;
 pub mod recap;
-mod redact;
+pub mod redact;
 pub mod references;
 pub mod remote;
 mod requirements;
