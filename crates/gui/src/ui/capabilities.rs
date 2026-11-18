@@ -70,7 +70,7 @@ pub(crate) struct Capabilities {
     server_target: Entity<InputState>,
     server_extras: Entity<TextareaState>,
     /// Why the pasted text filled nothing in, or what the last add came to.
-    server_note: Option<Result<String, String>>,
+    pub(crate) server_note: Option<Result<String, String>>,
 }
 
 impl Capabilities {

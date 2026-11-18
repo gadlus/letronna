@@ -6,6 +6,10 @@
 //! Windows registers an uninstall entry and a Start Menu shortcut; Linux
 //! installs into `~/.local/bin` with a desktop entry; macOS runs in place,
 //! since a real install there means building an .app bundle.
+//!
+//! Both also make the installed copy what opens a `letronna://` link, which
+//! it is started with as its first argument (`ui::marketplace`); on macOS
+//! the bundle's Info.plist says so (`scripts/bundle-macos.sh`).
 
 /// Copy the app to its installed location and relaunch from there. Returns
 /// true when this process should exit because the installed copy took over.
@@ -39,7 +43,7 @@ pub(crate) fn single_instance() -> bool {
     // Started again by an update, the copy it replaces is still on its way
     // out: wait for it rather than hand over to it.
     #[cfg(any(windows, target_os = "linux"))]
-    if std::env::args().any(|a| a == "--relaunch") {
+    if crate::ui::marketplace::link_arg().is_none() && std::env::args().any(|a| a == "--relaunch") {
         for _ in 0..50 {
             if imp::alone() {
                 return true;
@@ -121,6 +125,11 @@ mod windows_impl {
         wide(&format!(
             "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{BRAND}"
         ))
+    }
+
+    /// The key that says what opens a `letronna://` link, or one `under` it.
+    fn link_key(under: &str) -> Vec<u16> {
+        wide(&format!("Software\\Classes\\letronna{under}"))
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -230,9 +239,11 @@ mod windows_impl {
         let target = dir.join(format!("{BRAND}.exe"));
         let key = registry_key();
         let installed_version = read_value(&key, "DisplayVersion");
+        // An install from before the marketplace's links opens none yet.
         let up_to_date = installed_version.as_deref() == Some(VERSION)
             && lnk.exists()
-            && !newer_than(&current, &target);
+            && !newer_than(&current, &target)
+            && read_value(&link_key(""), "URL Protocol").is_some();
         let relocated = !same_file(&current, &target);
         if up_to_date && !relocated {
             return false;
@@ -265,6 +276,15 @@ mod windows_impl {
         set_value(&key, "URLInfoAbout", "https://github.com/wweziza/letronna");
         set_value(&key, "NoModify", "1");
         set_value(&key, "NoRepair", "1");
+        // A `letronna://` link starts this copy with the link, quoted, as
+        // its first argument, and a start given a link reads nothing else.
+        set_value(&link_key(""), "", &format!("URL:{BRAND}"));
+        set_value(&link_key(""), "URL Protocol", "");
+        set_value(
+            &link_key("\\shell\\open\\command"),
+            "",
+            &format!("\"{exe}\" \"%1\""),
+        );
         relocated && Command::new(&target).spawn().is_ok()
     }
 
@@ -283,6 +303,7 @@ mod windows_impl {
         }
         unsafe {
             RegDeleteTreeW(HKEY_CURRENT_USER, registry_key().as_ptr());
+            RegDeleteTreeW(HKEY_CURRENT_USER, link_key("").as_ptr());
         }
         if let Some(dir) = install_dir() {
             remove_from_path(&dir.join("bin"));
@@ -322,7 +343,8 @@ mod windows_impl {
     }
 }
 
-/// The XDG desktop entry that puts Letronna in the application menu.
+/// The XDG desktop entry that puts Letronna in the application menu and
+/// makes it what a `letronna://` link opens, the link in place of `%u`.
 /// Pure so it can be checked from any platform, hence the allow: only Linux
 /// calls it, but the test that pins its shape runs everywhere.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -332,10 +354,11 @@ fn desktop_entry(exec: &str, icon: &str) -> String {
          Type=Application\n\
          Name={brand}\n\
          Comment=A small native desktop agent\n\
-         Exec={exec}\n\
+         Exec={exec} %u\n\
          Icon={icon}\n\
          Terminal=false\n\
          Categories=Utility;Development;\n\
+         MimeType=x-scheme-handler/letronna;\n\
          StartupWMClass={brand}\n",
         brand = crate::app::BRAND,
     )
@@ -402,6 +425,9 @@ mod linux_impl {
             return false;
         };
         if current == target {
+            // An install from before the marketplace's links has an entry
+            // that opens none.
+            register(&target, &entry);
             return false;
         }
         for dir in [target.parent(), entry.parent()].into_iter().flatten() {
@@ -415,10 +441,37 @@ mod linux_impl {
             return false;
         }
         set_executable(&target);
-        let _ = std::fs::write(&entry, desktop_entry(&target.to_string_lossy(), "letronna"));
+        register(&target, &entry);
         // Hand over to the installed copy so later launches and the desktop
         // entry are the same binary.
         std::process::Command::new(&target).spawn().is_ok()
+    }
+
+    /// Write the desktop entry for the copy at `target`, and have the
+    /// desktop send `letronna://` links to it, unless the entry there says
+    /// all of it already.
+    fn register(target: &Path, entry: &Path) {
+        use std::process::{Command, Stdio};
+        let text = desktop_entry(&target.to_string_lossy(), "letronna");
+        if std::fs::read_to_string(entry).is_ok_and(|now| now == text) {
+            return;
+        }
+        if std::fs::write(entry, text).is_err() {
+            return;
+        }
+        // Where the desktop has these, it learns of the link at once; one
+        // without them reads the entry for itself, in its own time.
+        let quietly = |command: &mut Command| {
+            let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+        };
+        quietly(Command::new("xdg-mime").args([
+            "default",
+            "letronna.desktop",
+            "x-scheme-handler/letronna",
+        ]));
+        if let Some(folder) = entry.parent() {
+            quietly(Command::new("update-desktop-database").arg(folder));
+        }
     }
 
     fn set_executable(path: &Path) {
@@ -446,7 +499,9 @@ mod tests {
     fn desktop_entry_is_a_valid_xdg_stanza() {
         let entry = desktop_entry("/home/me/.local/bin/letronna", "letronna");
         assert!(entry.starts_with("[Desktop Entry]\n"));
-        assert!(entry.contains("Exec=/home/me/.local/bin/letronna\n"));
+        // A link the desktop opens is the one argument, where `%u` is.
+        assert!(entry.contains("Exec=/home/me/.local/bin/letronna %u\n"));
+        assert!(entry.contains("MimeType=x-scheme-handler/letronna;\n"));
         assert!(entry.contains("Name=Letronna\n"));
         assert!(entry.contains("Type=Application\n"));
         // Panels match a window to its launcher by this, so it must be the

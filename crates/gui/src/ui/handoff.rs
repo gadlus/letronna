@@ -32,6 +32,10 @@ fn named(mut args: impl Iterator<Item = String>) -> Option<u64> {
 
 /// The session this start of the window was asked to open.
 pub(crate) fn session_flag() -> Option<u64> {
+    // After a link, nothing is a flag: its writer may have written the rest.
+    if crate::ui::marketplace::link_arg().is_some() {
+        return None;
+    }
     named(std::env::args().skip(1))
 }
 

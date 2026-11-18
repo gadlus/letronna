@@ -793,26 +793,33 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
 fn main() {
     // The first mark, from which the others are timed.
     letronna_core::diag::mark("start");
+    // A link from the marketplace is this start's first argument, and
+    // whoever wrote it may have written what follows it too: with one, no
+    // flag is read, so no link can ask for `--uninstall`.
+    let link = ui::marketplace::link_arg();
+    let flag = |name: &str| link.is_none() && std::env::args().any(|a| a == name);
     // Asked by the updater and the release build before a new binary is
     // trusted. First, because a release build that went on would install
     // itself over the Letronna already there.
-    if std::env::args().any(|a| a == "--version") {
+    if flag("--version") {
         println!("{BRAND} {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     // A Claude Code session the removed Claude Code plugin started still names
     // this binary as its hook; without an answer Claude Code goes on as it
     // would, so it gets none rather than a window.
-    if std::env::args().any(|a| a == "--claude-code-hook") {
+    if flag("--claude-code-hook") {
         return;
     }
-    if std::env::args().any(|a| a == "--uninstall") {
+    if flag("--uninstall") {
         platform::install::uninstall();
     }
     if platform::install::ensure_installed() || !platform::install::single_instance() {
         // The window that runs, or the installed copy started instead,
-        // takes the session from the file this leaves.
-        if let Some(id) = ui::handoff::session_flag() {
+        // takes the session or the link from the file this leaves.
+        if let Some(link) = &link {
+            ui::marketplace::ask_for(link);
+        } else if let Some(id) = ui::handoff::session_flag() {
             ui::handoff::ask_for(id);
         }
         return;
@@ -820,6 +827,10 @@ fn main() {
     // An update downloaded last time goes in now, before anything is running,
     // and so does the old version when a new one keeps failing to start.
     if let Some(program) = letronna_core::update::on_start() {
+        // The copy started in this one's place takes the link from the file.
+        if let Some(link) = &link {
+            ui::marketplace::ask_for(link);
+        }
         let _ = std::process::Command::new(program)
             .arg("--relaunch")
             .spawn();
@@ -833,6 +844,9 @@ fn main() {
     // A click on the Dock icon while the window is in the Dock brings it
     // back, as it does for any Mac app; elsewhere nothing calls it.
     app.on_reopen(platform::tray::show_main_window);
+    // macOS hands a `letronna://` link to the app that runs, or starts it
+    // for one; elsewhere the link is a start's first argument instead.
+    app.on_open_urls(|links| links.into_iter().for_each(ui::marketplace::arrived));
     app.run(|cx| {
         letronna_core::diag::mark("app");
         gpui_component::init(cx);

@@ -37,6 +37,9 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$tmp/Letronna.iconset" -o "$app/Contents/Resources/Letronna.icns"
 
+# CFBundleURLTypes makes this app what opens a letronna:// link, such as the
+# marketplace's letronna://marketplace/<id>; macOS hands the link to the app
+# that runs, or starts it for one.
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,6 +55,13 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>10.15.7</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>com.gadlus.letronna</string>
+      <key>CFBundleURLSchemes</key><array><string>letronna</string></array>
+    </dict>
+  </array>
   <key>NSMicrophoneUsageDescription</key><string>Letronna listens only while you record a message for it to type out.</string>
   <key>NSAppleEventsUsageDescription</key><string>A command Letronna runs for you is asking to control this app.</string>
 </dict>

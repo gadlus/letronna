@@ -58,6 +58,14 @@ pub(crate) fn show_main_window(cx: &mut App) {
     open_main(cx, |_, _, _| {});
 }
 
+/// Bring the window forward on the dialog for a link the system handed
+/// over, which says what the link names before anything is added.
+pub(crate) fn open_link(link: String, cx: &mut App) {
+    open_main(cx, move |this, window, cx| {
+        this.open_link(&link, window, cx)
+    });
+}
+
 /// Bring the window forward on the About page and look for a new version.
 fn check_for_updates(cx: &mut App) {
     open_main(cx, |this, window, cx| {

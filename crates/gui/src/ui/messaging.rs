@@ -60,6 +60,13 @@ const CHANNELS: &[Channel] = &[
     },
 ];
 
+/// Where the channel called `name`, in any case, is in the list.
+pub(crate) fn channel_named(name: &str) -> Option<usize> {
+    CHANNELS
+        .iter()
+        .position(|channel| channel.built && channel.name.eq_ignore_ascii_case(name))
+}
+
 impl Chat {
     fn save_messaging(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = messaging::save(&self.messaging) {

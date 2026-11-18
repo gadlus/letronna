@@ -561,7 +561,7 @@ impl Chat {
 
 /// What an add did, in a line: "Added 18 skills, updated 2 skills", and
 /// where the copies it replaced went.
-fn install_note(installed: &Installed) -> String {
+pub(crate) fn install_note(installed: &Installed) -> String {
     let count = |n: usize, one: &str| match n {
         1 => one.to_owned(),
         n => format!("{n} skills"),

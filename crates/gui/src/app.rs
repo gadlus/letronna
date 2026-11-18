@@ -1338,6 +1338,7 @@ impl Chat {
         Self::watch_sessions(cx);
         Self::watch_accounts(cx);
         Self::watch_asked(cx);
+        Self::watch_links(cx);
         // What the file says of the plan is as of the last check, which may
         // be from before an upgrade on the website.
         this.check_upgrade(cx);

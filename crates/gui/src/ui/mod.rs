@@ -22,6 +22,7 @@ pub(crate) mod import;
 pub(crate) mod import_page;
 pub(crate) mod jobs;
 pub(crate) mod keys;
+pub(crate) mod marketplace;
 pub(crate) mod mcp;
 pub(crate) mod memory;
 pub(crate) mod messages;
