@@ -69,6 +69,7 @@ pub mod limits;
 mod login_env;
 pub mod lsp;
 mod machine;
+pub mod marketplace;
 pub mod mcp;
 pub mod mcp_auth;
 mod mcp_find;
