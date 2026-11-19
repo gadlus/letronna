@@ -51,10 +51,12 @@ use letronna_core::{agent, gateway, hooks, permissions, references, tools, untru
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// The one version of the protocol spoken here, whatever the editor asks for.
 const PROTOCOL_VERSION: u64 = 1;
@@ -90,6 +92,11 @@ pub trait Home {
     /// The work of asking every set-up gateway for its models, as (gateway,
     /// model), which is done off the reader's thread.
     fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send>;
+    /// The gateway and model a new session starts on: the settings' own.
+    fn default_model(&self) -> (String, String);
+    /// Whether the gateway called `name` is set up on this computer, so a
+    /// model may be picked on it before it has answered with its own.
+    fn set_up(&self, name: &str) -> bool;
 }
 
 /// The modes an editor can pick, in the order its picker lists them: the
@@ -149,15 +156,69 @@ struct Session {
     transcript: Option<Transcript>,
     /// Stops the turn running now, if there is one.
     cancel: Cancel,
+    /// What it was on before a model picked ahead of the gateways' answer,
+    /// until its next prompt settles that pick.
+    unsettled: Option<Before>,
 }
+
+/// What a session was on before a model picked ahead of the gateways'
+/// answer, to be put back on if they do not offer it.
+struct Before {
+    /// Where its requests went, and as whose.
+    connection: Connection,
+    /// The gateway the model option named.
+    gateway: String,
+    /// The gateway and model its conversation was held to.
+    held: (Option<String>, Option<String>),
+}
+
+impl Session {
+    /// Sends its requests where `to`'s go and as the gateway `to` was made
+    /// for, which the option names `gateway`: only that, so its mode and
+    /// the rest stay the session's.
+    fn route(&mut self, to: Connection, gateway: String) {
+        self.connection.endpoint = to.endpoint;
+        self.connection.key = to.key;
+        self.connection.model = to.model;
+        // The wire, the headers and the plan a request counts against all
+        // go by the gateway's name, not by its address.
+        self.connection.gateway = to.gateway;
+        self.gateway = gateway;
+    }
+
+    /// Puts it back on what it was on `before` a pick no gateway offers,
+    /// its conversation home again from the turn that never ran.
+    fn put_back(&mut self, before: Before, mut transcript: Transcript) {
+        let conversation = &mut transcript.conversation;
+        (conversation.gateway, conversation.model) = before.held;
+        self.route(before.connection, before.gateway);
+        self.transcript = Some(transcript);
+    }
+}
+
+/// What is known of the gateways' models, and whether they are being asked.
+#[derive(Default)]
+struct Models {
+    /// What they offered when last asked, by name then gateway: None until
+    /// an ask of them has finished, whatever it brought, since only then
+    /// is a model on no list known to be one no gateway offers.
+    known: Option<Vec<(String, String)>>,
+    /// An ask is under way, which a second caller waits for.
+    asking: bool,
+}
+
+/// The gateways' models, and the word that an ask of them has finished.
+type Asked = Arc<(Mutex<Models>, Condvar)>;
+
+/// The work of asking the gateways, as `Home::models` hands it over.
+type Ask = Box<dyn FnOnce() -> Vec<(String, String)> + Send>;
 
 /// The agent end of one connection to an editor.
 struct Agent {
     out: Out,
     home: Box<dyn Home>,
     sessions: Arc<Mutex<HashMap<u64, Session>>>,
-    /// The models the gateways offered when last asked, by name then gateway.
-    models: Arc<Mutex<Vec<(String, String)>>>,
+    models: Asked,
     /// Permission requests the editor has not answered yet, by the id each went out with.
     asked: Arc<Mutex<HashMap<u64, Request>>>,
     /// The tools the editor said to allow always, by session.
@@ -251,6 +312,17 @@ impl Home for Runner {
             }
             models
         })
+    }
+
+    fn default_model(&self) -> (String, String) {
+        let settings = &self.store.settings;
+        (settings.gateway.clone(), settings.model.clone())
+    }
+
+    fn set_up(&self, name: &str) -> bool {
+        let custom = &self.store.settings.custom_endpoint;
+        let ready = gateway::ready(&store::load_keys(), custom);
+        ready.iter().any(|(gateway, ..)| *gateway == name)
     }
 }
 
@@ -414,12 +486,34 @@ impl Agent {
             });
             return;
         }
+        // The gateways are asked over the network, and a folder may wait on
+        // a slow disk or on the system's own question about reading it, so
+        // these too are answered off this loop.
+        if method == MODELS {
+            self.list_models(id);
+            return;
+        }
+        if let Some(asked) = method.strip_prefix(FOLDERS) {
+            let (out, asked, params) = (self.out.clone(), asked.to_owned(), params.clone());
+            std::thread::spawn(move || {
+                let frame = match folders_reply(asked, params) {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err((code, error)) => failure(id, code, &error),
+                };
+                send(&out, &frame);
+            });
+            return;
+        }
         let reply = match method {
             "initialize" => Ok(initialized()),
             "session/new" => self.new_session(params),
             "session/load" => self.load_session(params),
             "session/list" => list_sessions(params),
-            "session/set_config_option" => self.set_option(params),
+            "session/set_config_option" => match self.set_option(id.clone(), params) {
+                // Replied to with the sessions held.
+                Ok(()) => return,
+                Err(error) => Err(error),
+            },
             "session/set_mode" => self.set_mode(params),
             "session/prompt" => match self.prompt(id.clone(), params) {
                 // The turn replies when it ends.
@@ -454,7 +548,7 @@ impl Agent {
         // none works where a session with no project does.
         let cwd = match self.client == Client::Phone && params["cwd"].is_null() {
             true => no_project()?,
-            false => folder(params)?,
+            false => folder(params, self.client)?,
         };
         let (connection, transcript) = self.home.start(&cwd).map_err(|e| (INTERNAL_ERROR, e))?;
         let id = transcript.conversation.id;
@@ -469,7 +563,7 @@ impl Agent {
         // A phone that names no folder reopens the session in its own.
         let cwd = match self.client == Client::Phone && params["cwd"].is_null() {
             true => None,
-            false => Some(folder(params)?),
+            false => Some(folder(params, self.client)?),
         };
         // Its turn would carry on into a conversation no longer held here.
         let running = lock(&self.sessions)
@@ -513,29 +607,36 @@ impl Agent {
             connection,
             transcript: Some(transcript),
             cancel: Cancel::default(),
+            unsettled: None,
         };
-        let options = options(&open, &lock(&self.models), self.client);
+        let options = options(&open, &known(&self.models).unwrap_or_default(), self.client);
         lock(&self.sessions).insert(id, open);
         (modes, options)
     }
 
     /// Puts the session the editor names on the model it picked, from its
     /// next turn, or in the mode it picked, as `set_mode` does, and gives the
-    /// options as they stand then.
-    fn set_option(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+    /// options as they stand then in the reply to `id`.
+    fn set_option(&mut self, id: Value, params: &Value) -> Result<(), (i64, String)> {
         let session = session_id(params)?;
         let option = params["configId"].as_str().unwrap_or_default();
         let picked = params["value"].as_str().unwrap_or_default();
+        // Each reply is sent with the sessions held, as every update that
+        // offers a session's options is, so the client hears them in the
+        // order they were made and is left showing what the session is on.
+        let replied = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
         if option == MODE {
             let mode = mode_named(picked, self.client)?;
-            let models = lock(&self.models).clone();
+            let models = known(&self.models).unwrap_or_default();
             let mut sessions = lock(&self.sessions);
             let Some(open) = sessions.get_mut(&session) else {
                 return Err((INVALID_PARAMS, format!("There is no session {session}.")));
             };
             // Unlike the model, mid-turn too: the gate reads it at each call.
             open.connection.switch_to(mode);
-            return Ok(json!({"configOptions": options(open, &models, self.client)}));
+            let result = json!({"configOptions": options(open, &models, self.client)});
+            send(&self.out, &replied(result));
+            return Ok(());
         }
         if option != MODEL {
             return Err((
@@ -543,15 +644,32 @@ impl Agent {
                 format!("There is no option `{option}` here."),
             ));
         }
-        let models = lock(&self.models).clone();
+        // Before the sessions are held, as whether a gateway is set up is
+        // read off the keys, which can wait on the Keychain's question.
+        let early = early_pick(picked)
+            .filter(|(gateway, _)| known(&self.models).is_none() && self.home.set_up(gateway));
         let mut sessions = lock(&self.sessions);
         let Some(open) = sessions.get_mut(&session) else {
             return Err((INVALID_PARAMS, format!("There is no session {session}.")));
         };
-        let current = (open.gateway.clone(), open.connection.model.clone());
-        let found = (models.iter().chain([&current]))
-            .find(|(gateway, model)| choice(gateway, model) == picked);
-        let Some((gateway, model)) = found.cloned() else {
+        // Read with the sessions held, as the gateways' answer is offered,
+        // so this reply never offers fewer models than an update before it.
+        let asked = known(&self.models);
+        let models = asked.clone().unwrap_or_default();
+        // What it stands on: its model, or the one before a pick that has
+        // yet to be settled, which is no surer for being picked again.
+        let standing = match &open.unsettled {
+            Some(before) => (before.gateway.clone(), before.connection.model.clone()),
+            None => (open.gateway.clone(), open.connection.model.clone()),
+        };
+        let found = (models.iter().chain([&standing]))
+            .find(|(gateway, model)| choice(gateway, model) == picked)
+            .cloned();
+        // A phone picks as soon as its session opens, before this new
+        // agent's gateways have answered: a model on one set up here is
+        // taken then, and settled when the session's next prompt comes.
+        let early = early.filter(|_| found.is_none() && asked.is_none());
+        let Some((gateway, model)) = found.or(early.clone()) else {
             return Err((INVALID_PARAMS, format!("No gateway offers `{picked}`.")));
         };
         // A turn's requests go on the model it began on, so a switch in the
@@ -574,41 +692,64 @@ impl Agent {
                 return Err((INVALID_PARAMS, error));
             }
         };
-        // Only where its requests go: its mode and the rest stay the session's.
-        open.connection.endpoint = connection.endpoint;
-        open.connection.key = connection.key;
-        open.connection.model = connection.model;
-        open.gateway = gateway;
-        // Written now, so the session reopens on it even before its next turn.
-        if let Err(e) = transcript.save() {
+        // Written now, so the session reopens on it even before its next
+        // turn; an early pick is written once its prompt settles it.
+        if early.is_none()
+            && let Err(e) = transcript.save()
+        {
             eprintln!("Could not save the model picked for session {session}: {e}");
         }
-        Ok(json!({"configOptions": options(open, &models, self.client)}))
+        let before = Before {
+            connection: open.connection.clone(),
+            gateway: open.gateway.clone(),
+            held: was,
+        };
+        open.route(connection, gateway);
+        match early {
+            // What it was on before the first of them is what it goes back to.
+            Some(_) => {
+                open.unsettled.get_or_insert(before);
+            }
+            None => open.unsettled = None,
+        }
+        let result = json!({"configOptions": options(open, &models, self.client)});
+        send(&self.out, &replied(result));
+        Ok(())
+    }
+
+    /// Answers request `id` with the models a new session can be put on,
+    /// asked of the gateways off this thread, and keeps them, so that one
+    /// picked from the answer is known when a session is set on it.
+    fn list_models(&self, id: Value) {
+        let ask = claim(&self.models).map(|claim| (claim, self.home.models()));
+        let current = self.home.default_model();
+        let (out, models) = (self.out.clone(), self.models.clone());
+        std::thread::spawn(move || {
+            let result = models_listed(ask_gateways(&models, ask), &current);
+            send(&out, &json!({"jsonrpc": "2.0", "id": id, "result": result}));
+        });
     }
 
     /// Asks the gateways for their models off this thread, then offers them
     /// in session `session`.
     fn offer_models(&self, session: u64) {
-        let ask = self.home.models();
+        let ask = claim(&self.models).map(|claim| (claim, self.home.models()));
         let (out, sessions, models) =
             (self.out.clone(), self.sessions.clone(), self.models.clone());
         let client = self.client;
         std::thread::spawn(move || {
-            let mut answered = ask();
-            // None answering is no news: the list known before still holds.
-            if answered.is_empty() {
+            let known = ask_gateways(&models, ask);
+            // None answering is no news: the session keeps what it was offered.
+            if known.is_empty() {
                 return;
             }
-            // As the terminal's `/model` lists them.
-            answered.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-            *lock(&models) = answered.clone();
-            let Some(options) =
-                (lock(&sessions).get(&session)).map(|open| options(open, &answered, client))
-            else {
+            // Sent with the sessions held, as a pick's reply is.
+            let sessions = lock(&sessions);
+            let Some(open) = sessions.get(&session) else {
                 return;
             };
-            let changed =
-                json!({"sessionUpdate": "config_option_update", "configOptions": options});
+            let changed = json!({"sessionUpdate": "config_option_update",
+                "configOptions": options(open, &known, client)});
             send(&out, &update(session, changed));
         });
     }
@@ -637,27 +778,27 @@ impl Agent {
         let Some(open) = sessions.get_mut(&session) else {
             return Err((INVALID_PARAMS, format!("There is no session {session}.")));
         };
-        let Some(mut transcript) = open.transcript.take() else {
+        let Some(transcript) = open.transcript.take() else {
             return Err((
                 INVALID_REQUEST,
                 "A turn is already running in this session.".into(),
             ));
         };
-        let conversation = &mut transcript.conversation;
+        let conversation = &transcript.conversation;
         // Saving and keeping memory as the session chose, wherever it chose.
         memory::choose(session, conversation.memory_saving);
         memory::choose_scope(session, conversation.memory_scope);
-        if conversation.messages.is_empty() && conversation.title.is_empty() {
-            conversation.title = letronna_core::store::name_from(&text);
-        }
-        conversation.updated = chat::now();
-        conversation.messages.push(Message {
-            role: "user".into(),
-            content: text,
-            ..Default::default()
-        });
         // A fresh one each turn, since a stop stays set.
         open.cancel = Cancel::default();
+        // A model picked before the gateways answered is settled on the
+        // turn's thread once they have, and if none asks them yet an ask
+        // is begun beside it, so a stop need not wait for that to end.
+        let picked = (open.gateway.clone(), open.connection.model.clone());
+        let unsettled = open.unsettled.take().map(|before| (before, picked));
+        let ask = match (&unsettled, known(&self.models)) {
+            (Some(_), None) => claim(&self.models).map(|claim| (claim, self.home.models())),
+            _ => None,
+        };
         let calls = Arc::new(Mutex::new(BTreeSet::new()));
         let spec = Spec {
             connection: open.connection.clone(),
@@ -686,10 +827,72 @@ impl Agent {
             )),
         };
         drop(sessions);
-        let (out, sessions) = (self.out.clone(), self.sessions.clone());
+        if let Some(ask) = ask {
+            let models = self.models.clone();
+            // One that cannot start drops its claim, and the turn runs on.
+            let _ = std::thread::Builder::new().spawn(move || ask_gateways(&models, Some(ask)));
+        }
+        let (out, sessions, models) =
+            (self.out.clone(), self.sessions.clone(), self.models.clone());
+        let client = self.client;
+        // Handed over once the turn's thread is there, so a turn that cannot
+        // start leaves its session as it was.
+        let (hand, handed) = mpsc::channel::<(Spec, Option<(Before, (String, String))>)>();
         let turn = std::thread::Builder::new()
             .name(format!("acp-{session}"))
             .spawn(move || {
+                let Ok((mut spec, unsettled)) = handed.recv() else {
+                    return;
+                };
+                if let Some((before, picked)) = unsettled {
+                    // Stopped while it waited: the prompt leaves nothing,
+                    // and the pick is settled by the next one.
+                    let Some(known) = answer(&models, &spec.cancel) else {
+                        if let Some(open) = lock(&sessions).get_mut(&session) {
+                            open.transcript = Some(spec.transcript);
+                            open.unsettled = Some(before);
+                        }
+                        let stopped = json!({"stopReason": "cancelled"});
+                        send(
+                            &out,
+                            &json!({"jsonrpc": "2.0", "id": id, "result": stopped}),
+                        );
+                        return;
+                    };
+                    if !stands(&picked, &known) {
+                        let mut held = lock(&sessions);
+                        if let Some(open) = held.get_mut(&session) {
+                            open.put_back(before, spec.transcript);
+                            // Told with the sessions held, as a pick's reply is.
+                            let changed = json!({"sessionUpdate": "config_option_update",
+                                "configOptions": options(open, &known, client)});
+                            send(&out, &update(session, changed));
+                        }
+                        drop(held);
+                        let gone = choice(&picked.0, &picked.1);
+                        let why = format!(
+                            "No gateway on this computer offers `{gone}`; pick another model."
+                        );
+                        send(&out, &failure(id, INVALID_REQUEST, &why));
+                        return;
+                    }
+                    // Settled, so written down as a listed pick is.
+                    if let Err(e) = spec.transcript.save() {
+                        eprintln!("Could not save the model picked for session {session}: {e}");
+                    }
+                }
+                // Only once the turn is sure to run, so a prompt ended
+                // unrun leaves nothing behind.
+                let conversation = &mut spec.transcript.conversation;
+                if conversation.messages.is_empty() && conversation.title.is_empty() {
+                    conversation.title = letronna_core::store::name_from(&text);
+                }
+                conversation.updated = chat::now();
+                conversation.messages.push(Message {
+                    role: "user".into(),
+                    content: text,
+                    ..Default::default()
+                });
                 let (report, transcript) = driver::run_keeping(spec);
                 let cancelled = match lock(&sessions).get_mut(&session) {
                     Some(open) => {
@@ -716,8 +919,18 @@ impl Agent {
                     &out,
                     &json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": reason}}),
                 );
-            })
-            .map_err(|e| (INTERNAL_ERROR, format!("Could not start the turn: {e}")))?;
+            });
+        let turn = match turn {
+            Ok(turn) => turn,
+            Err(e) => {
+                if let Some(open) = lock(&self.sessions).get_mut(&session) {
+                    open.transcript = Some(spec.transcript);
+                    open.unsettled = unsettled.map(|(before, _)| before);
+                }
+                return Err((INTERNAL_ERROR, format!("Could not start the turn: {e}")));
+            }
+        };
+        let _ = hand.send((spec, unsettled));
         self.turns.retain(|turn| !turn.is_finished());
         self.turns.push(turn);
         Ok(())
@@ -766,6 +979,105 @@ impl Agent {
         };
         request.answer(decision);
     }
+}
+
+/// What the gateways were last known to offer, if they have been asked.
+fn known(models: &Asked) -> Option<Vec<(String, String)>> {
+    lock(&models.0).known.clone()
+}
+
+/// The next ask of the gateways, held by the caller that is to run it,
+/// which lets those waiting for it go when dropped, run or not.
+struct Claim(Asked);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let (state, finished) = &*self.0;
+        let mut held = lock(state);
+        held.asking = false;
+        finished.notify_all();
+    }
+}
+
+/// Takes the next ask of the gateways for the caller, unless one is under
+/// way: told on the reader's loop, so of requests that follow one another
+/// the first asks and the rest wait for it.
+fn claim(models: &Asked) -> Option<Claim> {
+    let free = !std::mem::replace(&mut lock(&models.0).asking, true);
+    free.then(|| Claim(models.clone()))
+}
+
+/// The gateways' models once an ask of them has finished, the one the
+/// caller claimed or else the one under way, so that no two callers hold
+/// different answers.
+fn ask_gateways(models: &Asked, ask: Option<(Claim, Ask)>) -> Vec<(String, String)> {
+    let Some((claim, ask)) = ask else {
+        // Never set, so it waits for the answer however long that takes.
+        return answer(models, &Cancel::default()).unwrap_or_default();
+    };
+    // An ask that panics has answered nothing.
+    let mut answered = catch_unwind(AssertUnwindSafe(ask)).unwrap_or_default();
+    // As the terminal's `/model` lists them.
+    answered.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut held = lock(&models.0);
+    // None answering is no news: the list known before still holds.
+    if !answered.is_empty() || held.known.is_none() {
+        held.known = Some(answered);
+    }
+    let known = held.known.clone().unwrap_or_default();
+    drop(held);
+    drop(claim);
+    known
+}
+
+/// The gateways' models once the ask under way has finished, or None as
+/// soon as `cancel` is set.
+fn answer(models: &Asked, cancel: &Cancel) -> Option<Vec<(String, String)>> {
+    let (state, finished) = &**models;
+    // A stop wakes the wait with their lock held, so it cannot fall
+    // between the look at it below and the wait.
+    let waking = models.clone();
+    let _waker = cancel.on_set(move || {
+        let _held = lock(&waking.0);
+        waking.1.notify_all();
+    });
+    let mut held = lock(state);
+    while !cancel.is_set() {
+        if !held.asking {
+            return Some(held.known.clone().unwrap_or_default());
+        }
+        held = finished.wait(held).unwrap_or_else(PoisonError::into_inner);
+    }
+    None
+}
+
+/// The longest model id taken before a gateway has listed it: longer than
+/// any gateway names one, and short enough for the address it may go in.
+const MODEL_ID: usize = 200;
+
+/// The gateway and model a pick names when it may be taken before any
+/// gateway has listed it: the model's id goes into requests, and for some
+/// providers into their address, so it is spelled only as ids are.
+fn early_pick(picked: &str) -> Option<(String, String)> {
+    let (gateway, model) = picked.split_once(':')?;
+    // Letronna's own (`letronna/fast`) and every router's ids have a `/`,
+    // so it is let in between parts, none of them `.` or `..`, which keeps
+    // an id that goes into an address to its own model's route.
+    let spelled = |c: char| c.is_ascii_alphanumeric() || "-_.:@+/".contains(c);
+    let parts = model
+        .split('/')
+        .all(|part| !matches!(part, "" | "." | ".."));
+    let sound = model.len() <= MODEL_ID && model.chars().all(spelled) && parts;
+    sound.then(|| (gateway.to_owned(), model.to_owned()))
+}
+
+/// Whether `picked`, a model taken before the gateways answered, stands by
+/// what they offer in `known`.
+fn stands(picked: &(String, String), known: &[(String, String)]) -> bool {
+    // A gateway that answered nothing has not said it lacks the model, so
+    // the pick is taken at its word and the turn's request tells.
+    let answered = known.iter().any(|(gateway, _)| *gateway == picked.0);
+    !answered || known.contains(picked)
 }
 
 /// The whole gate of session `session`, for its own turn begun in `began`.
@@ -920,6 +1232,482 @@ fn accounts_call(asked: &str, params: &Value) -> Result<Value, (i64, String)> {
     }
 }
 
+/// Letronna's own method for the models a new session can be put on, which
+/// a phone asks before it has a session to be offered them in.
+const MODELS: &str = "_letronna/models";
+
+/// What `MODELS` answers: `models`, each once for its provider, as the
+/// values a session's model option takes, and `current`, the one a new
+/// session starts on, which is among them whether or not a gateway said so.
+fn models_listed(models: Vec<(String, String)>, current: &(String, String)) -> Value {
+    let mut offered = gateway::one_per_provider(models, (&current.0, &current.1));
+    // With nothing set up there is no model to start on, and none to name.
+    let starts = !current.1.is_empty();
+    if starts && !offered.contains(current) {
+        offered.insert(0, current.clone());
+    }
+    let choices: Vec<Value> = offered
+        .iter()
+        .map(|(gateway, model)| {
+            json!({"value": choice(gateway, model), "name": format!("{model} · {gateway}")})
+        })
+        .collect();
+    let mut listed = json!({"models": choices});
+    if starts {
+        listed["current"] = choice(&current.0, &current.1).into();
+    }
+    listed
+}
+
+/// What Letronna's own methods for this computer's folders start with, by
+/// which a paired phone finds one to work in, and which an editor may ask
+/// as well, since they name folders and never what a file holds.
+const FOLDERS: &str = "_letronna/folders/";
+
+/// How many folders worked in lately are listed: more than a phone shows
+/// before its user would rather look for one.
+const RECENT: usize = 30;
+
+/// How many of the folders in one are listed: more than anyone scrolls
+/// through on a phone, and few enough to send in one frame.
+const LISTED: usize = 300;
+
+/// How many folder calls may be at the disk at once, since one held up
+/// there keeps its thread until the disk lets it go.
+const AT_THE_DISK: usize = 4;
+
+/// How long a folder call's answer is waited for: longer than a disk that
+/// is well takes, and short enough for the phone to be told why.
+const FOLDER_WAIT: Duration = Duration::from_secs(10);
+
+/// How long one folder is looked for where a longer wait would hold up
+/// more than it: on the reader's own thread, or among the recent ones.
+const FOLDER_LOOK: Duration = Duration::from_secs(2);
+
+/// Work at the disk: its place, what it is about, whether it is a folder
+/// call that `AT_THE_DISK` counts, and whether it was given up on.
+struct Reading {
+    place: u64,
+    key: String,
+    call: bool,
+    late: bool,
+}
+
+/// The work at the disk now.
+static READING: Mutex<Vec<Reading>> = Mutex::new(Vec::new());
+
+/// The number the next place at the disk goes by.
+static PLACES: AtomicU64 = AtomicU64::new(0);
+
+/// A place for work at the disk, given back when that ends, however it
+/// ends.
+struct Place(u64);
+
+impl Place {
+    /// One for a folder call about `key`, unless all `AT_THE_DISK` are taken.
+    fn take(key: String) -> Option<Self> {
+        let mut reading = lock(&READING);
+        let calls = reading.iter().filter(|work| work.call).count();
+        (calls < AT_THE_DISK).then(|| Self::enter(&mut reading, key, true))
+    }
+
+    /// One for a look about `key` that a call holding a place makes.
+    fn beside(key: String) -> Self {
+        Self::enter(&mut lock(&READING), key, false)
+    }
+
+    /// Puts work about `key` among `reading`, a folder call if `call`.
+    fn enter(reading: &mut Vec<Reading>, key: String, call: bool) -> Self {
+        let place = PLACES.fetch_add(1, Ordering::Relaxed);
+        reading.push(Reading {
+            place,
+            key,
+            call,
+            late: false,
+        });
+        Place(place)
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        lock(&READING).retain(|work| work.place != self.0);
+    }
+}
+
+/// Marks the work at `place` as given up on, unless it has ended meanwhile.
+fn given_up(place: u64) {
+    let mut reading = lock(&READING);
+    if let Some(work) = reading.iter_mut().find(|work| work.place == place) {
+        work.late = true;
+    }
+}
+
+/// Whether work about `key` was given up on and is at the disk still.
+fn held_up(key: &str) -> bool {
+    let reading = lock(&READING);
+    (reading.iter()).any(|work| work.late && work.key == key)
+}
+
+/// What the phone is told when reading `path` is taking too long.
+fn too_long(path: &str) -> String {
+    format!(
+        "Reading `{path}` is taking too long on the computer; it may be asking there for \
+         permission to read it."
+    )
+}
+
+/// Answer the folder method `asked` as `folders_call` does, at the disk
+/// for `FOLDER_WAIT` at the most.
+fn folders_reply(asked: String, params: Value) -> Result<Value, (i64, String)> {
+    let typed = params["path"].as_str();
+    // Read as the call reads it, so one folder however it is spelled is
+    // one path to be held up on.
+    let path = typed.map_or_else(home_spelled, spelled);
+    let key = match (asked.as_str(), path) {
+        ("recent", _) | (_, None) => asked.clone(),
+        (_, Some(path)) => format!("{asked} {}", tidy(&path).display()),
+    };
+    let slow = match typed {
+        Some(path) => too_long(path),
+        None => "Reading this computer's folders is taking too long; it may be asking there \
+            for permission to read one, or a disk is not answering."
+            .to_owned(),
+    };
+    at_the_disk(key, slow, FOLDER_WAIT, move || {
+        folders_call(&asked, &params)
+    })
+}
+
+/// What `work` about `key` gives, done in a place at the disk and waited
+/// for no longer than `wait`, or what the phone is told instead, `slow`
+/// when that is the wait.
+fn at_the_disk<T: Send + 'static>(
+    key: String,
+    slow: String,
+    wait: Duration,
+    work: impl FnOnce() -> Result<T, (i64, String)> + Send + 'static,
+) -> Result<T, (i64, String)> {
+    // Another worker on it would only be held up beside the first.
+    if held_up(&key) {
+        return Err((INTERNAL_ERROR, slow));
+    }
+    let Some(place) = Place::take(key) else {
+        let busy = "This computer is still reading folders it was asked for before, and may be \
+            waiting for someone at it to allow reading one; ask again in a moment.";
+        return Err((INVALID_REQUEST, busy.into()));
+    };
+    in_place(place, wait, work).unwrap_or(Err((INTERNAL_ERROR, slow)))
+}
+
+/// What `work` gives, done in `place` on a thread of its own, or None when
+/// it has not ended within `wait` and was given up on.
+fn in_place<T: Send + 'static>(
+    place: Place,
+    wait: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let at = place.0;
+    let done = within(wait, move || {
+        let done = work();
+        // Given back before the answer goes, so whoever hears it can ask
+        // again at once.
+        drop(place);
+        done
+    });
+    // Its place stays taken until it ends, or a disk that never answers
+    // would have threads piled up on it.
+    if done.is_none() {
+        given_up(at);
+    }
+    done
+}
+
+/// Whether `folder` is one `is_folder` takes, looked at for `FOLDER_LOOK`
+/// at the most, and not at all while an earlier look at it is held up.
+fn still_there(folder: &Path) -> bool {
+    let key = format!("folder {}", tidy(folder).display());
+    if held_up(&key) {
+        return false;
+    }
+    let folder = folder.to_owned();
+    in_place(Place::beside(key), FOLDER_LOOK, move || is_folder(&folder)).unwrap_or(false)
+}
+
+/// What `work` gives, done on a thread of its own, or None when it has not
+/// ended within `wait`: it is left to end when it will, and what it gives
+/// then is dropped.
+fn within<T: Send + 'static>(
+    wait: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (done, result) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    result.recv_timeout(wait).ok()
+}
+
+/// What a path with a `.` or `..` on its way is refused with.
+fn roundabout(typed: &str) -> (i64, String) {
+    let why = format!("`{typed}` has a `.` or `..` in it; give the folder's own path.");
+    (INVALID_PARAMS, why)
+}
+
+/// Answer one of the folder methods, `asked` being its name after `FOLDERS`.
+fn folders_call(asked: &str, params: &Value) -> Result<Value, (i64, String)> {
+    match asked {
+        "recent" => {
+            let folders = recent_folders(store::summaries(), chat::fallback_folder(), RECENT);
+            let home = home().map(|home| home.display().to_string());
+            Ok(json!({"folders": folders, "home": home}))
+        }
+        "check" => {
+            let typed = params["path"].as_str().map(str::trim).unwrap_or_default();
+            if typed.is_empty() {
+                return Err((INVALID_PARAMS, "`path` is missing.".into()));
+            }
+            Ok(named(&typed_in(typed)?))
+        }
+        "list" => {
+            let path = match &params["path"] {
+                Value::Null => home().ok_or((
+                    INTERNAL_ERROR,
+                    "This computer has no home folder to list.".to_owned(),
+                ))?,
+                Value::String(given) => typed_in(given)?,
+                _ => return Err(nowhere("")),
+            };
+            let (inside, more) = children(&path, LISTED).map_err(|e| {
+                let why = format!("`{}` could not be opened: {}.", path.display(), e.kind());
+                (INVALID_PARAMS, why)
+            })?;
+            let folders: Vec<Value> = (inside.iter())
+                .map(|name| named(&path.join(name)))
+                .collect();
+            let mut listing = named(&path);
+            // None at the top of a disk, which is in nothing.
+            listing["parent"] = (path.parent())
+                .map(|parent| parent.display().to_string())
+                .into();
+            listing["folders"] = folders.into();
+            listing["more"] = more.into();
+            Ok(listing)
+        }
+        _ => Err((
+            METHOD_NOT_FOUND,
+            format!("There is no method `{FOLDERS}{asked}` here."),
+        )),
+    }
+}
+
+/// What a path that names no folder here is refused with.
+fn nowhere(typed: &str) -> (i64, String) {
+    let why = format!("There is no folder at `{typed}` on this computer.");
+    (INVALID_PARAMS, why)
+}
+
+/// The folder a path typed on the phone names, read as `spelled` reads it,
+/// or why it is not one to look in.
+fn typed_in(typed: &str) -> Result<PathBuf, (i64, String)> {
+    let found = spelled(typed).ok_or_else(|| nowhere(typed))?;
+    // Looked at once `~` is read, which may bring one of its own.
+    if !straight(&found) {
+        return Err(roundabout(typed));
+    }
+    if !is_folder(&found) {
+        return Err(nowhere(typed));
+    }
+    Ok(tidy(&found))
+}
+
+/// The home folder, which is what core reads `~` as, when it is one
+/// `is_folder` takes.
+fn home() -> Option<PathBuf> {
+    home_spelled()
+        .filter(|home| is_folder(home))
+        .map(|home| tidy(&home))
+}
+
+/// The home folder as core's `typed_folder` reads `~`, before anything on
+/// the disk is opened.
+fn home_spelled() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(PathBuf::from)
+}
+
+/// A path typed on the phone as core's `typed_folder` reads it, `~` and
+/// quotes and all, before anything on the disk is opened.
+fn spelled(typed: &str) -> Option<PathBuf> {
+    let typed = typed.trim().trim_matches('"');
+    match typed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            Some(home_spelled()?.join(rest.trim_start_matches(['/', '\\'])))
+        }
+        _ => Some(PathBuf::from(typed)),
+    }
+}
+
+/// `path` without the separator a typed path may end in, as a bare `~`
+/// read by core does.
+fn tidy(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// Whether `path` names its folder outright, with no `.` or `..` on the
+/// way: with one it could name a folder by a way through another, and
+/// neither its name nor the folder it is in could be read off it.
+fn straight(path: &Path) -> bool {
+    let spelled = path.to_string_lossy();
+    let mut parts = spelled.split(std::path::is_separator);
+    !parts.any(|part| part == "." || part == "..")
+}
+
+/// Whether `path` is a folder here that may be looked at: given in full
+/// and outright, there, and neither spelled as nor reached by a link to
+/// anything Windows would open as something else, judged before it is.
+fn is_folder(path: &Path) -> bool {
+    letronna_core::paths::unsafe_raw(&path.to_string_lossy(), None).is_none()
+        && straight(path)
+        && path.is_absolute()
+        && links_safe(path)
+        && path.is_dir()
+}
+
+/// How many links the way to a folder may go through: more than anyone
+/// sets up by hand, and few enough that a loop of them ends at once.
+const HOPS: usize = 8;
+
+/// Whether every link on the way to `path`, `HOPS` at the most, points
+/// somewhere safe to open as it is spelled, as on Windows one to another
+/// computer's share would sign in there.
+fn links_safe(path: &Path) -> bool {
+    let parts = |path: &Path| -> Vec<PathBuf> {
+        (path.components().rev())
+            .map(|part| part.as_os_str().into())
+            .collect()
+    };
+    // What is left to walk, the next part last: each link is read where
+    // it is, never followed, and what it points to is walked in its place.
+    let (mut left, mut at, mut hops) = (parts(path), PathBuf::new(), 0);
+    while let Some(part) = left.pop() {
+        let next = at.join(&part);
+        let link = std::fs::symlink_metadata(&next).is_ok_and(|meta| meta.is_symlink());
+        if !link {
+            at = next;
+            continue;
+        }
+        hops += 1;
+        let Ok(target) = std::fs::read_link(&next) else {
+            return false;
+        };
+        let unsafe_raw = letronna_core::paths::unsafe_raw(&target.to_string_lossy(), None);
+        if hops > HOPS || unsafe_raw.is_some() {
+            return false;
+        }
+        // From the link's own folder, `at`, unless it is given in full.
+        left.extend(parts(&target));
+    }
+    true
+}
+
+/// A folder as the phone lists it: where it is, and its last part to show.
+fn named(path: &Path) -> Value {
+    let whole = path.display().to_string();
+    // The top of a disk has no last part, and goes by its whole name.
+    let name = (path.file_name()).map_or_else(|| whole.clone(), |n| n.to_string_lossy().into());
+    json!({"path": whole, "name": name})
+}
+
+/// What `folders/recent` lists: the folders still there that `sessions`
+/// with something said in them work in, newest first, each once and `most`
+/// at the most, with when each was last worked in, then `fallback`, where a
+/// session with no project works, unless it is among them.
+fn recent_folders(
+    mut sessions: Vec<Summary>,
+    fallback: Option<PathBuf>,
+    most: usize,
+) -> Vec<Value> {
+    sessions.retain(|session| session.messages > 0);
+    // By id too, so sessions saved in the same second keep one order.
+    sessions.sort_by_key(|session| std::cmp::Reverse((session.updated, session.id)));
+    let (mut met, mut kept) = (BTreeSet::new(), Vec::<(PathBuf, u64)>::new());
+    for session in sessions {
+        if kept.len() == most {
+            break;
+        }
+        let Some(workspace) = session.workspace else {
+            continue;
+        };
+        // Sessions far outnumber their folders, so a spelling met before
+        // is passed over without another look at the disk: by its letters,
+        // as a path with a `.` in it compares equal to the one without.
+        if !met.insert(workspace.as_os_str().to_owned()) || !still_there(&workspace) {
+            continue;
+        }
+        let listed = (kept.iter()).any(|(folder, _)| same_folder(folder, &workspace));
+        if !listed {
+            kept.push((tidy(&workspace), session.updated));
+        }
+    }
+    let mut folders: Vec<Value> = kept
+        .iter()
+        .map(|(folder, updated)| {
+            let mut entry = named(folder);
+            let updated = i64::try_from(*updated).ok();
+            if let Some(at) =
+                updated.and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            {
+                entry["updatedAt"] = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into();
+            }
+            entry
+        })
+        .collect();
+    let fallback = fallback.filter(|fallback| {
+        still_there(fallback) && !kept.iter().any(|(folder, _)| same_folder(folder, fallback))
+    });
+    folders.extend(fallback.map(|fallback| named(&fallback)));
+    folders
+}
+
+/// Whether a folder called `name` is left out of a listing: one hidden by
+/// its dot, and those Windows keeps for itself on any disk it has used,
+/// where nobody works, though a Mac's `Library` is listed, as some do.
+fn hidden(name: &str) -> bool {
+    name.starts_with(['.', '$']) || name == "System Volume Information"
+}
+
+/// Whether `entry` is a folder, or a link that leads to one by no hop that
+/// `links_safe` refuses.
+fn holds_folders(entry: &std::fs::DirEntry) -> bool {
+    let Ok(kind) = entry.file_type() else {
+        return false;
+    };
+    if !kind.is_symlink() {
+        return kind.is_dir();
+    }
+    let link = entry.path();
+    links_safe(&link) && link.is_dir()
+}
+
+/// The names of the folders in `path`, a link to one among them, without
+/// the hidden ones, in the order a list reads them whatever their case:
+/// `most` at the most, and whether there were more.
+fn children(path: &Path, most: usize) -> std::io::Result<(Vec<String>, bool)> {
+    let mut names: Vec<String> = std::fs::read_dir(path)?
+        .flatten()
+        .filter_map(|entry| {
+            // A name that is not text could not be sent back to be opened.
+            let name = entry.file_name().into_string().ok()?;
+            (!hidden(&name) && holds_folders(&entry)).then_some(name)
+        })
+        .collect();
+    names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+    let more = names.len() > most;
+    names.truncate(most);
+    Ok((names, more))
+}
+
 /// The session a request names, as the number its id is made from.
 fn session_id(params: &Value) -> Result<u64, (i64, String)> {
     params["sessionId"]
@@ -946,12 +1734,29 @@ fn no_project() -> Result<PathBuf, (i64, String)> {
     Ok(folder)
 }
 
-/// The folder a request names as `cwd`, which must be one given in full.
-fn folder(params: &Value) -> Result<PathBuf, (i64, String)> {
+/// The folder a request names as `cwd`, which must be one given in full,
+/// and from a phone one that `is_folder` takes.
+fn folder(params: &Value, client: Client) -> Result<PathBuf, (i64, String)> {
     let Some(cwd) = params["cwd"].as_str().map(PathBuf::from) else {
         return Err((INVALID_PARAMS, "`cwd` is required.".into()));
     };
-    if !cwd.is_absolute() || !cwd.is_dir() {
+    // An editor's is taken as it always was: on Windows a project may well
+    // be on a share, which the user at this computer opened themselves.
+    let phone = client == Client::Phone;
+    if phone && !straight(&cwd) {
+        return Err(roundabout(&cwd.display().to_string()));
+    }
+    let given = match phone {
+        // Looked at as the folder methods look, held to a deadline, since
+        // this is the reader's own thread.
+        true => {
+            let (key, path) = (format!("cwd {}", tidy(&cwd).display()), cwd.clone());
+            let slow = too_long(&cwd.display().to_string());
+            at_the_disk(key, slow, FOLDER_LOOK, move || Ok(is_folder(&path)))?
+        }
+        false => cwd.is_absolute() && cwd.is_dir(),
+    };
+    if !given {
         return Err((
             INVALID_PARAMS,
             format!("`{}` is not a folder given in full.", cwd.display()),
@@ -1369,8 +2174,8 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
 
     /// Far longer than any turn here takes, so only a hang fails a test.
     const WAIT: Duration = Duration::from_secs(60);
@@ -1378,6 +2183,9 @@ mod tests {
     const SESSIONS: u64 = 1 << 41;
     /// Held by every test, since permission requests go to whoever served last.
     static SERVING: Mutex<()> = Mutex::new(());
+    /// Held by a test for as long as the gateways are to keep it waiting
+    /// for their models.
+    static ANSWERING: Mutex<()> = Mutex::new(());
 
     /// An empty folder of its own for `name`, made again on each run.
     fn scratch(name: &str) -> PathBuf {
@@ -1512,6 +2320,11 @@ mod tests {
 
         /// The same, as `client`.
         fn connect_as(endpoint: String, first: u64, client: Client) -> Self {
+            Self::served_by(Test::at(endpoint, first), client)
+        }
+
+        /// Connects as `client` to an agent that serves `home`.
+        fn served_by(home: Test, client: Client) -> Self {
             let serving = lock(&SERVING);
             let data =
                 std::env::temp_dir().join(format!("letronna-acp-{}-data", std::process::id()));
@@ -1524,7 +2337,7 @@ mod tests {
                     line: Vec::new(),
                     frames,
                 });
-                serve(input.into_iter(), output, opener(endpoint, first), client)
+                serve(input.into_iter(), output, Box::new(home), client)
             });
             Self {
                 to: Some(to),
@@ -1585,6 +2398,23 @@ mod tests {
     struct Test {
         endpoint: String,
         next: u64,
+        /// Where a second gateway, "Other", answers, when there is one.
+        other: Option<String>,
+        /// How many times the gateways were asked for their models.
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl Test {
+        /// Opens sessions numbered from `first`, each asking the provider at
+        /// `endpoint`, with no gateway but "Custom".
+        fn at(endpoint: String, first: u64) -> Self {
+            Self {
+                endpoint,
+                next: first,
+                other: None,
+                asked: Arc::default(),
+            }
+        }
     }
 
     impl Home for Test {
@@ -1606,10 +2436,18 @@ mod tests {
             let model = (conversation.model)
                 .get_or_insert_with(|| "test-model".into())
                 .clone();
-            conversation.gateway.get_or_insert_with(|| "Custom".into());
+            let gateway = (conversation.gateway)
+                .get_or_insert_with(|| "Custom".into())
+                .clone();
+            let endpoint = match (gateway.as_str(), &self.other) {
+                ("Other", Some(other)) => other.clone(),
+                _ => self.endpoint.clone(),
+            };
             Ok(Connection {
-                endpoint: self.endpoint.clone(),
+                endpoint,
                 model,
+                // Made for its gateway by name, as the runner's is.
+                gateway,
                 tools: true,
                 workspace: conversation.workspace.clone(),
                 conversation: conversation.id,
@@ -1620,22 +2458,26 @@ mod tests {
         }
 
         fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send> {
-            Box::new(|| {
-                vec![
-                    ("Custom".into(), "test-model".into()),
-                    ("Custom".into(), "other-model".into()),
-                ]
+            let (other, asked) = (self.other.is_some(), self.asked.clone());
+            Box::new(move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                // Not before a test that holds them back lets them answer.
+                let _answering = lock(&ANSWERING);
+                let far = other.then_some(("Other", "far-model"));
+                let models = [("Custom", "test-model"), ("Custom", "other-model")];
+                (models.into_iter().chain(far))
+                    .map(|(gateway, model)| (gateway.to_owned(), model.to_owned()))
+                    .collect()
             })
         }
-    }
 
-    /// Opens sessions numbered from `first`, each asking the provider at
-    /// `endpoint` and written into the folder it works in.
-    fn opener(endpoint: String, first: u64) -> Box<dyn Home> {
-        Box::new(Test {
-            endpoint,
-            next: first,
-        })
+        fn default_model(&self) -> (String, String) {
+            ("Custom".into(), "test-model".into())
+        }
+
+        fn set_up(&self, name: &str) -> bool {
+            name == "Custom" || (name == "Other" && self.other.is_some())
+        }
     }
 
     impl Drop for Editor {
@@ -2377,6 +3219,612 @@ mod tests {
             .map(|_| heard.recv_timeout(WAIT).unwrap()["model"].clone())
             .collect();
         assert_eq!(models, ["test-model", "test-model", "other-model"]);
+    }
+
+    /// Whether `frame` tells a session's options anew.
+    fn is_options(frame: &Value) -> bool {
+        frame["params"]["update"]["sessionUpdate"] == "config_option_update"
+    }
+
+    /// The model `frame`, a reply or an update, says its session is on.
+    fn model_in(frame: &Value) -> &Value {
+        let told = match frame.get("result") {
+            Some(result) => result,
+            None => &frame["params"]["update"],
+        };
+        &told["configOptions"][0]["currentValue"]
+    }
+
+    #[test]
+    fn a_phone_lists_the_models_before_it_has_a_session_and_picks_one_as_listed() {
+        let dir = scratch("models");
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 330, Client::Phone);
+        let list = phone.ask(MODELS, json!({}));
+        let (_, listed) = phone.reply(list);
+        let test_model = json!({"value": "Custom:test-model", "name": "test-model · Custom"});
+        let other_model = json!({"value": "Custom:other-model", "name": "other-model · Custom"});
+        assert_eq!(
+            listed["result"],
+            json!({"models": [other_model, test_model], "current": "Custom:test-model"})
+        );
+
+        // The gateways are not heard again for the session, so what it is
+        // held to is what that answer left known: a model no gateway
+        // listed is refused, where before any answer it would be taken.
+        let answering = lock(&ANSWERING);
+        let new = phone.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, opened) = phone.reply(new);
+        let session = opened["result"]["sessionId"].as_str().unwrap().to_owned();
+        assert_eq!(model_in(&opened), &listed["result"]["current"]);
+        let unlisted = pick_model(&mut phone, &session, "Custom:made-up");
+        let (_, refused) = phone.reply(unlisted);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+        // And any that was listed is taken as it was given.
+        let value = listed["result"]["models"][0]["value"].as_str().unwrap();
+        let pick = pick_model(&mut phone, &session, value);
+        let (_, switched) = phone.reply(pick);
+        assert_eq!(model_in(&switched), "Custom:other-model");
+        drop(answering);
+
+        // With no gateway answering there is still the one to start on, and
+        // with nothing set up there is none to name.
+        let current = ("Custom".to_owned(), "test-model".to_owned());
+        assert_eq!(
+            models_listed(Vec::new(), &current),
+            json!({"models": [test_model], "current": "Custom:test-model"})
+        );
+        let nothing = Default::default();
+        assert_eq!(models_listed(Vec::new(), &nothing), json!({"models": []}));
+    }
+
+    #[test]
+    fn a_model_picked_before_the_gateways_answer_is_taken_and_its_first_turn_waits_to_run_on_it() {
+        let dir = scratch("early-listed");
+        let (here, heard_here) = listening(Vec::new());
+        let (there, heard_there) = listening(vec![reply("From over there.", &[])]);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let home = Test {
+            other: Some(there),
+            asked: asked.clone(),
+            ..Test::at(here, SESSIONS + 340)
+        };
+        let mut phone = Editor::served_by(home, Client::Phone);
+        // The gateways are kept from answering while the phone picks.
+        let answering = lock(&ANSWERING);
+        let session = phone.open(&dir);
+
+        // Not on a gateway that is not set up, and not a model whose id
+        // could not be one.
+        let long = format!("Other:{}", "m".repeat(MODEL_ID + 1));
+        let odd = [
+            "Other:far?model",
+            "Other:far#model",
+            "Other:../far",
+            "Other:org//far",
+        ];
+        let wrongs = ["Nowhere:far-model", "Other:", "Other:far model", &long];
+        for wrong in wrongs.into_iter().chain(odd) {
+            let pick = pick_model(&mut phone, &session, wrong);
+            let (_, refused) = phone.reply(pick);
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+            let why = format!("No gateway offers `{wrong}`.");
+            assert_eq!(refused["error"]["message"], why);
+        }
+        // As routers and Letronna's own name theirs, a `/` between parts.
+        let routed = early_pick("Other:org/far-model.v2:free@a+b");
+        assert_eq!(routed.unwrap().1, "org/far-model.v2:free@a+b");
+        let pick = pick_model(&mut phone, &session, "Other:far-model");
+        let (before, taken) = phone.reply(pick);
+        assert!(!before.iter().any(is_options), "the gateways had answered");
+        assert_eq!(model_in(&taken), "Other:far-model", "{taken}");
+
+        // Its first turn holds the session while it waits for them.
+        let prompt = start(&mut phone, &session, "Say where you are.");
+        let during = pick_model(&mut phone, &session, "Custom:test-model");
+        let (_, refused) = phone.reply(during);
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST, "{refused}");
+        assert!(heard_there.try_recv().is_err(), "it ran too soon");
+        // They list it, so it runs on it, at its own gateway, the turn
+        // having joined the ask the session's opening began.
+        drop(answering);
+        let (_, ended) = phone.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn", "{ended}");
+        let body = heard_there.recv_timeout(WAIT).unwrap();
+        assert_eq!(body["model"], "far-model");
+        assert!(heard_here.try_recv().is_err(), "the old gateway was asked");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_model_picked_before_the_gateways_answer_that_they_lack_ends_the_prompt_and_is_put_back() {
+        let dir = scratch("early-unlisted");
+        let (endpoint, heard) = listening(vec![reply("Back on it.", &[])]);
+        let mut phone = Editor::connect_as(endpoint, SESSIONS + 380, Client::Phone);
+        let id = SESSIONS + 380;
+        let session = id.to_string();
+        let on = || store::saved(id).unwrap().model.unwrap();
+        saved(
+            id,
+            &dir,
+            100,
+            vec![said("user", "Hello."), said("assistant", "Hi.")],
+        );
+        let answering = lock(&ANSWERING);
+        let load = phone.ask(
+            "session/load",
+            json!({"sessionId": session, "cwd": dir, "mcpServers": []}),
+        );
+        phone.reply(load);
+        // Taken, but not written down while it is not known to be a model,
+        // however often it is picked.
+        for _ in 0..2 {
+            let pick = pick_model(&mut phone, &session, "Custom:made-up");
+            let (_, taken) = phone.reply(pick);
+            assert_eq!(model_in(&taken), "Custom:made-up", "{taken}");
+            assert_eq!(on(), "old-model");
+        }
+
+        // Its gateway answers without it: the prompt ends unrun, and the
+        // session is back on its model, as the phone is told first.
+        let prompt = start(&mut phone, &session, "Still there?");
+        drop(answering);
+        let (before, refused) = phone.reply(prompt);
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST, "{refused}");
+        let why = "No gateway on this computer offers `Custom:made-up`; pick another model.";
+        assert_eq!(refused["error"]["message"], why);
+        let told = (before.iter())
+            .rfind(|frame| is_options(frame))
+            .expect("never told");
+        assert_eq!(model_in(told), "Custom:old-model");
+        assert_eq!(on(), "old-model");
+
+        // The next prompt runs on it, and the one ended unrun left nothing.
+        let again = start(&mut phone, &session, "Carry on.");
+        let (_, ended) = phone.reply(again);
+        assert_eq!(ended["result"]["stopReason"], "end_turn", "{ended}");
+        let body = heard.recv_timeout(WAIT).unwrap();
+        assert_eq!(body["model"], "old-model");
+        assert!(!body.to_string().contains("Still there?"), "{body}");
+
+        // A gateway that answered nothing has not said it lacks a model.
+        let known = [("Custom".to_owned(), "test-model".to_owned())];
+        assert!(stands(&("Other".into(), "far-model".into()), &known));
+        assert!(!stands(&("Custom".into(), "made-up".into()), &known));
+    }
+
+    #[test]
+    fn a_stop_while_a_turn_waits_for_the_gateways_ends_it_at_once_and_leaves_the_pick_unsettled() {
+        let dir = scratch("early-stopped");
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 440, Client::Phone);
+        let id = SESSIONS + 440;
+        let session = id.to_string();
+        saved(id, &dir, 100, vec![said("user", "Hello.")]);
+        let answering = lock(&ANSWERING);
+        let load = phone.ask(
+            "session/load",
+            json!({"sessionId": session, "cwd": dir, "mcpServers": []}),
+        );
+        phone.reply(load);
+        let pick = pick_model(&mut phone, &session, "Custom:made-up");
+        phone.reply(pick);
+
+        // Ended while the gateways are still kept from answering.
+        let prompt = start(&mut phone, &session, "Never mind.");
+        phone.send(json!({"jsonrpc": "2.0", "method": "session/cancel",
+            "params": {"sessionId": session}}));
+        let (_, ended) = phone.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "cancelled", "{ended}");
+        assert_eq!(store::saved(id).unwrap().model.unwrap(), "old-model");
+
+        // The pick is still to be settled, which the next prompt does.
+        drop(answering);
+        let again = start(&mut phone, &session, "Still there?");
+        let (_, refused) = phone.reply(again);
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST, "{refused}");
+        let kept = store::saved(id).unwrap();
+        assert_eq!(kept.messages.len(), 1, "a prompt that never ran was kept");
+    }
+
+    #[test]
+    fn a_claim_on_the_gateways_dropped_unrun_lets_whoever_waits_for_it_go() {
+        let models: Asked = Arc::default();
+        let first = claim(&models).expect("nothing was asking");
+        assert!(claim(&models).is_none());
+        let waiting = models.clone();
+        let waiter = std::thread::spawn(move || answer(&waiting, &Cancel::default()));
+        drop(first);
+        assert_eq!(waiter.join().unwrap(), Some(Vec::new()));
+        assert!(claim(&models).is_some());
+    }
+
+    #[test]
+    fn a_model_picked_on_another_gateway_is_asked_at_that_gateway() {
+        let dir = scratch("other-gateway");
+        let (here, heard_here) = listening(Vec::new());
+        let (there, heard_there) = listening(vec![reply("From over there.", &[])]);
+        let home = Test {
+            other: Some(there.clone()),
+            ..Test::at(here, SESSIONS + 390)
+        };
+        let mut editor = Editor::served_by(home, Client::Editor);
+        let session = editor.open(&dir);
+        editor.until(is_options);
+        let pick = pick_model(&mut editor, &session, "Other:far-model");
+        let (_, switched) = editor.reply(pick);
+        assert_eq!(model_in(&switched), "Other:far-model", "{switched}");
+        let prompt = start(&mut editor, &session, "Say where you are.");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn", "{ended}");
+        assert_eq!(
+            heard_there.recv_timeout(WAIT).unwrap()["model"],
+            "far-model"
+        );
+        assert!(heard_here.try_recv().is_err(), "the old gateway was asked");
+
+        // As whose its requests go moves with where they go: the format, the
+        // headers and the plan they count against all go by that name.
+        let mut open = Session {
+            connection: Connection {
+                gateway: "Custom".into(),
+                ..Default::default()
+            },
+            gateway: "Custom".into(),
+            transcript: None,
+            cancel: Cancel::default(),
+            unsettled: None,
+        };
+        let to = Connection {
+            endpoint: there,
+            model: "far-model".into(),
+            gateway: "Other".into(),
+            ..Default::default()
+        };
+        open.route(to, "Other".into());
+        assert_eq!(open.connection.account(), "Other");
+        assert_eq!(open.connection.model, "far-model");
+    }
+
+    #[test]
+    fn the_runner_names_the_model_a_new_session_starts_on_and_the_gateways_set_up() {
+        let _serving = lock(&SERVING);
+        let data = std::env::temp_dir().join(format!("letronna-acp-{}-data", std::process::id()));
+        // Only this module's tests look here, and all of them set the same.
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: false,
+            helpers_answered: false,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+            plain_terminal: false,
+            way_out: None,
+        };
+        runner.store.settings.gateway = "Ollama".into();
+        runner.store.settings.model = "test-model".into();
+        let starts_on = ("Ollama".to_owned(), "test-model".to_owned());
+        assert_eq!(runner.default_model(), starts_on);
+        // A local server needs no setting up; a gateway with no key saved
+        // is not set up, and neither is a name no gateway goes by.
+        assert!(runner.set_up("Ollama"));
+        assert!(!runner.set_up("OpenAI"));
+        assert!(!runner.set_up("Nowhere"));
+    }
+
+    /// Asks the folder method `asked` and gives the reply.
+    fn folders(editor: &mut Editor, asked: &str, params: Value) -> Value {
+        let id = editor.ask(&format!("{FOLDERS}{asked}"), params);
+        editor.reply(id).1
+    }
+
+    /// A folder as the folder methods name it.
+    fn entry(dir: &Path) -> Value {
+        let name = dir.file_name().unwrap().to_string_lossy();
+        json!({"path": dir.display().to_string(), "name": name})
+    }
+
+    #[test]
+    fn folders_worked_in_lately_are_listed_newest_first_and_each_once() {
+        let (older, newer) = (scratch("recent-older"), scratch("recent-newer"));
+        let (quiet, gone) = (scratch("recent-quiet"), scratch("recent-gone"));
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 350, Client::Phone);
+        // In the year 2100: later than any session another test here saves.
+        let (first, then) = (SESSIONS + 350, 4_102_444_800);
+        saved(first, &older, then, vec![said("user", "First.")]);
+        saved(first + 1, &newer, then + 120, vec![said("user", "Second.")]);
+        saved(first + 2, &older, then + 60, vec![said("user", "Third.")]);
+        // One folder, by whatever way it is reached.
+        let linked = older.with_file_name(format!("letronna-acp-{}-linked", std::process::id()));
+        let _ = std::fs::remove_file(&linked);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&older, &linked).unwrap();
+        saved(first + 3, &linked, then + 30, vec![said("user", "Fourth.")]);
+        // A path that goes round by `.` is not one to start a session with.
+        let dotted = newer.join(".");
+        saved(first + 6, &dotted, then + 150, vec![said("user", "Sixth.")]);
+        // Nothing was said in one, and the other's folder has gone since.
+        saved(first + 4, &quiet, then + 180, Vec::new());
+        saved(first + 5, &gone, then + 240, vec![said("user", "Fifth.")]);
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let listed = folders(&mut phone, "recent", json!({}));
+        let result = &listed["result"];
+        let recent = result["folders"].as_array().unwrap();
+        let (mut newest, mut next) = (entry(&newer), entry(&older));
+        newest["updatedAt"] = "2100-01-01T00:02:00Z".into();
+        next["updatedAt"] = "2100-01-01T00:01:00Z".into();
+        assert_eq!(recent[..2], [newest, next], "{listed}");
+        let paths: Vec<&str> = (recent.iter())
+            .map(|folder| folder["path"].as_str().unwrap())
+            .collect();
+        for left_out in [&linked, &dotted, &quiet, &gone] {
+            let path = left_out.display().to_string();
+            assert!(!paths.contains(&path.as_str()), "{path} in {paths:?}");
+        }
+        // The home folder is named as the system names it, or null when
+        // there is none to list.
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        let home = (home.map(PathBuf::from)).filter(|home| home.is_dir());
+        let home = home.map_or(Value::Null, |home| tidy(&home).display().to_string().into());
+        assert_eq!(result["home"], home, "{listed}");
+
+        // Where a session with no project works comes last, once it is
+        // there and unless it is listed already, after the most of the rest.
+        let fallback = scratch("recent-fallback");
+        let capped = recent_folders(store::summaries(), Some(fallback.clone()), 1);
+        assert_eq!(capped, [recent[0].clone(), entry(&fallback)]);
+        let twice = recent_folders(store::summaries(), Some(older), 2);
+        assert_eq!(twice, recent[..2]);
+        let missing = recent_folders(store::summaries(), Some(gone), 2);
+        assert_eq!(missing, recent[..2]);
+        let _ = std::fs::remove_file(&linked);
+    }
+
+    #[test]
+    fn a_folder_typed_on_the_phone_is_checked_to_be_one_on_this_computer() {
+        let dir = scratch("check");
+        std::fs::write(dir.join("notes.txt"), "words").unwrap();
+        std::fs::create_dir(dir.join("inner")).unwrap();
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 360, Client::Phone);
+        // As pasted, with spaces around it and a separator after it.
+        let typed = format!(" {}/ ", dir.display());
+        let found = folders(&mut phone, "check", json!({"path": typed}));
+        assert_eq!(found["result"], entry(&dir), "{found}");
+
+        let file = dir.join("notes.txt").display().to_string();
+        let missing = dir.join("missing").display().to_string();
+        for wrong in [file.as_str(), missing.as_str(), "some/where"] {
+            let refused = folders(&mut phone, "check", json!({"path": wrong}));
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+            let why = format!("There is no folder at `{wrong}` on this computer.");
+            assert_eq!(refused["error"]["message"], why);
+        }
+        // A way round to a folder that is there is not its path: neither
+        // its name nor the folder it is in could be read off it. Nor is it
+        // one to list, or to start a session in.
+        let up = dir.join("inner").join("..").display().to_string();
+        let around = dir.join(".").join("inner").display().to_string();
+        for wrong in [up.as_str(), around.as_str()] {
+            let why = format!("`{wrong}` has a `.` or `..` in it; give the folder's own path.");
+            for asked in ["check", "list"] {
+                let refused = folders(&mut phone, asked, json!({"path": wrong}));
+                assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+                assert_eq!(refused["error"]["message"], why);
+            }
+            let new = phone.ask("session/new", json!({"cwd": wrong, "mcpServers": []}));
+            let (_, refused) = phone.reply(new);
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+            assert_eq!(refused["error"]["message"], why);
+        }
+        let unnamed = folders(&mut phone, "check", json!({}));
+        assert_eq!(unnamed["error"]["code"], INVALID_PARAMS);
+        let unknown = folders(&mut phone, "fly", json!({}));
+        assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn a_folder_is_listed_as_the_folders_in_it_by_name_without_the_hidden_ones() {
+        let dir = scratch("inside");
+        // Hidden by a dot, or Windows' own on a disk it has used; a Mac's
+        // `Library` is neither.
+        let unlisted = [".hidden", "$Recycle.Bin", "System Volume Information"];
+        for name in ["gamma", "Beta", "alpha", "Library"]
+            .iter()
+            .chain(&unlisted)
+        {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "words").unwrap();
+        // A link to a folder is one to look in; a link to a file is not,
+        // nor one to nothing.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("gamma"), dir.join("delta")).unwrap();
+            std::os::unix::fs::symlink(dir.join("notes.txt"), dir.join("epsilon")).unwrap();
+            std::os::unix::fs::symlink(dir.join("missing"), dir.join("zeta")).unwrap();
+        }
+        let inside = ["alpha", "Beta", "delta", "gamma", "Library"];
+        let inside = (inside.iter()).filter(|name| cfg!(unix) || **name != "delta");
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 370);
+
+        let listed = folders(&mut editor, "list", json!({"path": dir}));
+        let mut expected = entry(&dir);
+        expected["parent"] = dir.parent().unwrap().display().to_string().into();
+        expected["folders"] = inside.map(|name| entry(&dir.join(name))).collect();
+        expected["more"] = false.into();
+        assert_eq!(listed["result"], expected, "{listed}");
+        // Cut at the most a list holds, and said to be.
+        let (first, more) = children(&dir, 2).unwrap();
+        assert_eq!(first, ["alpha", "Beta"]);
+        assert!(more);
+
+        let file = dir.join("notes.txt").display().to_string();
+        for wrong in ["inside", file.as_str()] {
+            let refused = folders(&mut editor, "list", json!({"path": wrong}));
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+        }
+        let not_text = folders(&mut editor, "list", json!({"path": 7}));
+        assert_eq!(not_text["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[test]
+    fn a_folder_call_held_up_at_the_disk_is_given_up_on_and_too_many_are_turned_away() {
+        // Work that has not ended in time is waited for no longer, and
+        // what it gives later goes nowhere.
+        let (let_go, held) = mpsc::channel::<()>();
+        let late = within(Duration::from_millis(50), move || held.recv().is_ok());
+        assert_eq!(late, None);
+        drop(let_go);
+        assert_eq!(within(WAIT, || 7), Some(7));
+
+        // With every place at the disk taken, as by calls held up there,
+        // the next is told so rather than left to wait behind them.
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 400, Client::Phone);
+        let taken: Vec<Place> = (0..AT_THE_DISK)
+            .filter_map(|_| Place::take(String::new()))
+            .collect();
+        assert_eq!(taken.len(), AT_THE_DISK);
+        let refused = folders(&mut phone, "recent", json!({}));
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST, "{refused}");
+        let why = refused["error"]["message"].as_str().unwrap();
+        assert!(why.contains("waiting for someone at it"), "{why}");
+        assert!(why.contains("ask again in a moment"), "{why}");
+        drop(taken);
+        let listed = folders(&mut phone, "recent", json!({}));
+        assert!(listed["result"]["folders"].is_array(), "{listed}");
+    }
+
+    #[test]
+    fn a_path_held_up_at_the_disk_is_answered_at_once_without_another_place() {
+        let _serving = lock(&SERVING);
+        let (path, key) = ("/held/up", "list /held/up".to_owned());
+        // Given up on, it keeps its place for as long as the disk holds it.
+        let (let_go, held) = mpsc::channel::<()>();
+        let quick = Duration::from_millis(50);
+        let late = at_the_disk(key.clone(), too_long(path), quick, move || {
+            Ok(held.recv().is_ok())
+        });
+        assert_eq!(late, Err((INTERNAL_ERROR, too_long(path))));
+        assert!(held_up(&key));
+        assert_eq!(lock(&READING).len(), 1);
+
+        // Asked about again with every other place taken, it is told at
+        // once however it is spelled, where any other path finds no place.
+        let others: Vec<Place> = (1..AT_THE_DISK)
+            .filter_map(|_| Place::take(String::new()))
+            .collect();
+        assert_eq!(others.len(), AT_THE_DISK - 1);
+        for spelled in [path, " /held/up/ ", "/held//up"] {
+            let again = folders_reply("list".into(), json!({"path": spelled}));
+            assert_eq!(again, Err((INTERNAL_ERROR, too_long(spelled))));
+        }
+        let elsewhere = folders_reply("list".into(), json!({"path": "/elsewhere"}));
+        assert_eq!(elsewhere.unwrap_err().0, INVALID_REQUEST);
+        // A recent folder is looked at without a place of its own, and
+        // passed over at once while an earlier look at it is held up.
+        let dir = scratch("held-up");
+        let look = Place::beside(format!("folder {}", dir.display()));
+        given_up(look.0);
+        assert!(!still_there(&dir));
+        drop(look);
+        assert!(still_there(&dir));
+        drop(others);
+
+        // Once the disk lets it go, its path is read as any other.
+        drop(let_go);
+        let gone = Instant::now() + WAIT;
+        while held_up(&key) {
+            assert!(Instant::now() < gone, "it never ended");
+            std::thread::yield_now();
+        }
+        assert_eq!(at_the_disk(key, too_long(path), WAIT, || Ok(7)), Ok(7));
+        assert!(lock(&READING).is_empty());
+    }
+
+    #[test]
+    fn an_editor_names_its_folder_as_it_likes_and_a_phone_by_the_folders_own_path() {
+        let dir = scratch("way-round");
+        std::fs::create_dir(dir.join("inner")).unwrap();
+        let up = dir.join("inner").join("..");
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 410);
+        let new = editor.ask("session/new", json!({"cwd": up, "mcpServers": []}));
+        let (_, opened) = editor.reply(new);
+        assert!(opened["result"]["sessionId"].is_string(), "{opened}");
+        drop(editor);
+
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 420, Client::Phone);
+        let new = phone.ask("session/new", json!({"cwd": up, "mcpServers": []}));
+        let (_, refused) = phone.reply(new);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
+        let why = roundabout(&up.display().to_string()).1;
+        assert_eq!(refused["error"]["message"], why);
+        // One held up at the disk is answered at once, so the reader's own
+        // thread never waits on it.
+        let held = Place::take(format!("cwd {}", dir.display())).unwrap();
+        given_up(held.0);
+        let new = phone.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, refused) = phone.reply(new);
+        let slow = too_long(&dir.display().to_string());
+        assert_eq!(
+            refused["error"],
+            json!({"code": INTERNAL_ERROR, "message": slow})
+        );
+        drop(held);
+        let new = phone.ask("session/new", json!({"cwd": dir, "mcpServers": []}));
+        let (_, opened) = phone.reply(new);
+        assert!(opened["result"]["sessionId"].is_string(), "{opened}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_read_from_its_own_folder_and_followed_only_so_many_hops() {
+        use std::os::unix::fs::symlink;
+        // Reached by no link of its own, so only the ones made here count.
+        let dir = std::fs::canonicalize(scratch("hops")).unwrap();
+        std::fs::create_dir(dir.join("end")).unwrap();
+        std::fs::create_dir(dir.join("inner")).unwrap();
+        symlink("../end", dir.join("inner").join("up")).unwrap();
+        assert!(links_safe(&dir.join("inner").join("up")));
+        // Each link in a chain names the one before it.
+        let mut to = "end".to_owned();
+        for hop in 1..=HOPS + 1 {
+            let link = format!("hop{hop}");
+            symlink(&to, dir.join(&link)).unwrap();
+            to = link;
+        }
+        let (most, too_many) = (format!("hop{HOPS}"), format!("hop{}", HOPS + 1));
+        assert!(links_safe(&dir.join(&most)));
+        assert!(!links_safe(&dir.join(&too_many)));
+        symlink("loop-b", dir.join("loop-a")).unwrap();
+        symlink("loop-a", dir.join("loop-b")).unwrap();
+        assert!(!links_safe(&dir.join("loop-a")));
+
+        // Listed, checked and worked in as far as that, and no further.
+        let mut phone = Editor::connect_as(provider(Vec::new()), SESSIONS + 430, Client::Phone);
+        let listed = folders(&mut phone, "list", json!({"path": dir}));
+        let names: Vec<&str> = (listed["result"]["folders"].as_array().unwrap().iter())
+            .map(|folder| folder["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&most.as_str()), "{names:?}");
+        assert!(!names.contains(&too_many.as_str()), "{names:?}");
+        assert!(!names.contains(&"loop-a"), "{names:?}");
+        for (name, there) in [(&most, true), (&too_many, false)] {
+            let checked = folders(&mut phone, "check", json!({"path": dir.join(name)}));
+            assert_eq!(checked.get("result").is_some(), there, "{checked}");
+        }
+        let new = phone.ask(
+            "session/new",
+            json!({"cwd": dir.join(&too_many), "mcpServers": []}),
+        );
+        let (_, refused) = phone.reply(new);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{refused}");
     }
 
     #[test]
