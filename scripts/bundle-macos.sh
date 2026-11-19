@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Wraps the release binary in target/Letronna.app. macOS reads the icon, the
-# display name and the menu bar title from a bundle, so a bare executable shows
-# a generic icon and a lowercase name however it is launched. Run after
-# `cargo build --release`. Pass --dmg to also package it for download.
+# Wraps the release binaries in target/Letronna.app: the window, and in
+# Contents/Helpers the terminal, which the window starts to answer a paired
+# phone. macOS reads the icon, the display name and the menu bar title from a
+# bundle, so a bare executable shows a generic icon and a lowercase name
+# however it is launched. Run after `cargo build --release`. Pass --dmg to
+# also package it for download.
 #
 # MACOS_SIGN_IDENTITY   a "Developer ID Application" identity to sign with
 # MACOS_NOTARY_PROFILE  a `notarytool store-credentials` profile; with it the
@@ -11,7 +13,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 bin=target/release/letronna-gui
 cli=target/release/letronna
-[ -x "$bin" ] || { echo "build it first: cargo build --release" >&2; exit 1; }
+for built in "$bin" "$cli"; do
+  [ -x "$built" ] || { echo "no $built, build it first: cargo build --release" >&2; exit 1; }
+done
 if [ -n "${MACOS_NOTARY_PROFILE-}" ] && [ -z "${MACOS_SIGN_IDENTITY-}" ]; then
   echo "MACOS_NOTARY_PROFILE needs MACOS_SIGN_IDENTITY: Apple notarizes only Developer ID code" >&2
   exit 1
@@ -20,8 +24,11 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 app=target/Letronna.app
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/Letronna"
+# Not beside the window: a Mac's disk ignores case, so `letronna` there would
+# be `Letronna` itself.
+cp "$cli" "$app/Contents/Helpers/letronna"
 
 # icon.ico is the same artwork Windows uses, with the rounded corners already
 # baked in, which is what macOS expects too. Its largest layer is 256px, so the
@@ -81,7 +88,9 @@ notarize() {
 # its cache, and ad-hoc is enough for that. Under the hardened runtime the
 # microphone stays silent without its entitlement, so voice input would
 # upload nothing but silence, and a command the app runs (osascript, say)
-# could not drive another app without the Apple Events one.
+# could not drive another app without the Apple Events one. The terminal
+# inside is signed first, as the app's signature seals what is in it, and
+# the whole is then checked: an app whose seal is broken is not handed on.
 if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
   cat > "$tmp/entitlements.plist" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
@@ -93,15 +102,17 @@ if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
 </dict>
 </plist>
 ENT
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" \
+    "$app/Contents/Helpers/letronna"
   codesign --force --options runtime --timestamp --entitlements "$tmp/entitlements.plist" \
     --sign "$MACOS_SIGN_IDENTITY" "$app"
   # The terminal is downloaded on its own too, so it carries the same name.
-  if [ -x "$cli" ]; then
-    codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$cli"
-  fi
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$cli"
 else
-  codesign --force --sign - "$app" >/dev/null 2>&1 || true
+  codesign --force --sign - "$app/Contents/Helpers/letronna"
+  codesign --force --sign - "$app"
 fi
+codesign --verify --strict "$app"
 
 # The app is notarized on its own and its ticket stapled before it goes in
 # the disk image, so a copy dragged out opens offline too. Apple cannot
@@ -111,10 +122,8 @@ if [ -n "${MACOS_NOTARY_PROFILE-}" ]; then
   ditto -c -k --keepParent "$app" "$tmp/Letronna.zip"
   notarize "$tmp/Letronna.zip"
   xcrun stapler staple -q "$app"
-  if [ -x "$cli" ]; then
-    ditto -c -k --keepParent "$cli" "$tmp/letronna.zip"
-    notarize "$tmp/letronna.zip"
-  fi
+  ditto -c -k --keepParent "$cli" "$tmp/letronna.zip"
+  notarize "$tmp/letronna.zip"
 fi
 touch "$app"
 echo "built $app ($version)"

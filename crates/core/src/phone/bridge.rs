@@ -137,9 +137,10 @@ impl Agents {
                 if !self.running.contains_key(phone) {
                     let started = terminal()
                         .ok_or_else(|| {
-                            "Letronna's terminal program, which answers the phone, was not \
-                             found beside the window or on PATH."
-                                .to_owned()
+                            format!(
+                                "Letronna's terminal program, which answers the phone, was \
+                                 not found {LOOKED}."
+                            )
                         })
                         .and_then(|program| Agent::start(&program, board.to(*phone)));
                     match started {
@@ -169,9 +170,19 @@ impl Agents {
     }
 }
 
-/// The terminal program: this one when it is the terminal, as under
-/// `letronna serve`; otherwise the one installed beside the window, or on
-/// PATH.
+/// Where `terminal` looks on this system, for the message that it found
+/// none.
+const LOOKED: &str = if cfg!(windows) {
+    "beside the window or on PATH"
+} else if cfg!(target_os = "macos") {
+    "inside the app, beside the window, in ~/.local/share/letronna/bin or on PATH"
+} else {
+    "beside the window, in ~/.local/share/letronna/bin or on PATH"
+};
+
+/// The terminal program for the window to start, as only a window answers
+/// phones: the one inside the app on a Mac, otherwise the one beside the
+/// window, where the installers put it, or on PATH.
 fn terminal() -> Option<PathBuf> {
     let me = std::env::current_exe().ok()?;
     let dir = me.parent()?;
@@ -192,15 +203,55 @@ fn terminal() -> Option<PathBuf> {
             .chain(on_path(exe))
             .find(|path| path.is_file());
     }
-    if name(&me) == "letronna" {
-        return Some(me);
+    #[cfg(unix)]
+    {
+        let home = crate::tools::home();
+        let path = std::env::var_os("PATH");
+        pick(
+            &me,
+            home.as_deref(),
+            path.iter().flat_map(std::env::split_paths),
+        )
     }
-    let home = crate::tools::home().map(|home| home.join(".local/bin/letronna"));
-    [dir.join("letronna")]
-        .into_iter()
-        .chain(home)
-        .chain(on_path("letronna"))
-        .find(|path| path.is_file())
+    #[cfg(not(unix))]
+    None
+}
+
+/// The first `letronna` the window at `me` can start: inside its app, beside
+/// it, where the installers put the terminal, in `~/.local/bin`, then in the
+/// folders of `path`.
+#[cfg(unix)]
+fn pick(me: &Path, home: Option<&Path>, path: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    let dir = me.parent()?;
+    // Only an app has the folder; beside any other, `Helpers` is not ours.
+    let app = (dir.ends_with("Contents/MacOS")).then(|| dir.with_file_name("Helpers"));
+    // In this order: `~/.local/bin/letronna` is a link to the installed
+    // terminal on a Mac, but on Linux the window, or a copy it made of itself.
+    let installed = (home.into_iter())
+        .flat_map(|home| [".local/share/letronna/bin", ".local/bin"].map(|at| home.join(at)));
+    (app.into_iter())
+        .chain([dir.to_path_buf()])
+        .chain(installed)
+        // One that is not a whole path leads wherever the window was started.
+        .chain(path.filter(|folder| folder.is_absolute()))
+        .map(|folder| folder.join("letronna"))
+        .find(|found| usable(found, me))
+}
+
+/// Whether the window at `me` can start `found` as the terminal: a file that
+/// may be run, and not the window under another name.
+#[cfg(unix)]
+fn usable(found: &Path, me: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(file) = std::fs::metadata(found) else {
+        return false;
+    };
+    // A file keeps its number through a link, and through `letronna` for
+    // `Letronna` on a disk that ignores case. The window started as the
+    // terminal opens a second window and never answers the phone.
+    let window = std::fs::metadata(me)
+        .is_ok_and(|window| (window.dev(), window.ino()) == (file.dev(), file.ino()));
+    file.is_file() && file.mode() & 0o111 != 0 && !window
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
@@ -211,7 +262,9 @@ fn on_path(name: &str) -> Option<PathBuf> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::Agent;
+    use super::{Agent, pick};
+    use crate::store::tests::Scratch;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -265,5 +318,127 @@ mod tests {
             heard.recv_timeout(Duration::from_secs(5)),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
+    }
+
+    /// An empty program at `path`, its folders made.
+    fn program(path: PathBuf) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// What the window at `window` starts, with `home` and `bin` under
+    /// `dir` as the home folder and the one folder on PATH.
+    fn picked(window: &Path, dir: &Path) -> Option<PathBuf> {
+        pick(
+            window,
+            Some(&dir.join("home")),
+            [dir.join("bin")].into_iter(),
+        )
+    }
+
+    #[test]
+    fn the_window_under_another_name_is_not_the_terminal() {
+        let dir = Scratch::new("phone-terminal-window");
+        let window = program(dir.join("app/Letronna"));
+        // A disk that ignores case has it under this name already, and
+        // refuses the link; on any other the link puts it there.
+        let _ = std::fs::hard_link(&window, dir.join("app/letronna"));
+        assert!(dir.join("app/letronna").is_file());
+        // And the command on PATH is a link to it.
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&window, dir.join("bin/letronna")).unwrap();
+        assert_eq!(picked(&window, &dir), None);
+        // A terminal further on is still found.
+        let installed = program(dir.join("home/.local/bin/letronna"));
+        assert_eq!(picked(&window, &dir), Some(installed));
+    }
+
+    #[test]
+    fn the_terminal_inside_the_app_is_picked_first() {
+        let dir = Scratch::new("phone-terminal-app");
+        let window = program(dir.join("Letronna.app/Contents/MacOS/Letronna"));
+        let inside = program(dir.join("Letronna.app/Contents/Helpers/letronna"));
+        program(dir.join("home/.local/share/letronna/bin/letronna"));
+        program(dir.join("home/.local/bin/letronna"));
+        program(dir.join("bin/letronna"));
+        assert_eq!(picked(&window, &dir), Some(inside));
+    }
+
+    #[test]
+    fn with_none_inside_the_app_the_installed_terminal_is_picked() {
+        let dir = Scratch::new("phone-terminal-installed");
+        let window = program(dir.join("Letronna.app/Contents/MacOS/Letronna"));
+        let installed = program(dir.join("home/.local/share/letronna/bin/letronna"));
+        let command = program(dir.join("home/.local/bin/letronna"));
+        let on_path = program(dir.join("bin/letronna"));
+        assert_eq!(picked(&window, &dir), Some(installed.clone()));
+        std::fs::remove_file(installed).unwrap();
+        assert_eq!(picked(&window, &dir), Some(command.clone()));
+        std::fs::remove_file(command).unwrap();
+        assert_eq!(picked(&window, &dir), Some(on_path));
+    }
+
+    #[test]
+    fn a_window_installed_as_the_command_picks_the_installed_terminal() {
+        let dir = Scratch::new("phone-terminal-command");
+        // Where the window puts itself on Linux, which is on PATH.
+        let window = program(dir.join("home/.local/bin/letronna"));
+        let installed = program(dir.join("home/.local/share/letronna/bin/letronna"));
+        // Beside a folder that is no app's, `Helpers` is not looked in.
+        program(dir.join("home/.local/Helpers/letronna"));
+        let path = [dir.join("home/.local/bin")].into_iter();
+        assert_eq!(
+            pick(&window, Some(&dir.join("home")), path),
+            Some(installed)
+        );
+    }
+
+    #[test]
+    fn a_copy_of_the_window_comes_after_the_installed_terminal() {
+        let dir = Scratch::new("phone-terminal-copy");
+        // As `letronna setup` leaves Linux: the window, the copy of itself
+        // it then makes in `~/.local/bin`, and the terminal.
+        let window = program(dir.join("home/.local/share/letronna/letronna-gui"));
+        program(dir.join("home/.local/bin/letronna"));
+        let installed = program(dir.join("home/.local/share/letronna/bin/letronna"));
+        assert_eq!(picked(&window, &dir), Some(installed));
+    }
+
+    #[test]
+    fn a_file_that_may_not_be_run_is_passed_over() {
+        let dir = Scratch::new("phone-terminal-plain");
+        let window = program(dir.join("Letronna.app/Contents/MacOS/Letronna"));
+        let plain = dir.join("home/.local/share/letronna/bin/letronna");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, b"").unwrap();
+        let on_path = program(dir.join("bin/letronna"));
+        assert_eq!(picked(&window, &dir), Some(on_path));
+    }
+
+    #[test]
+    fn a_folder_on_path_that_is_not_a_whole_path_is_not_looked_in() {
+        let dir = Scratch::new("phone-terminal-relative");
+        let window = program(dir.join("Letronna.app/Contents/MacOS/Letronna"));
+        let terminal = program(dir.join("bin/letronna"));
+        // The same folder, as a path from where the tests run.
+        let here = std::env::current_dir().unwrap();
+        let up: PathBuf = here.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(dir.join("bin").strip_prefix("/").unwrap());
+        assert!(relative.join("letronna").is_file());
+        assert_eq!(pick(&window, None, [relative].into_iter()), None);
+        let whole = [dir.join("bin")].into_iter();
+        assert_eq!(pick(&window, None, whole), Some(terminal));
+    }
+
+    #[test]
+    fn with_no_terminal_anywhere_none_is_picked() {
+        let dir = Scratch::new("phone-terminal-none");
+        let window = program(dir.join("Letronna.app/Contents/MacOS/Letronna"));
+        // A folder of that name is not a program.
+        std::fs::create_dir_all(dir.join("home/.local/bin/letronna")).unwrap();
+        assert_eq!(picked(&window, &dir), None);
     }
 }
