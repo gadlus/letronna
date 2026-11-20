@@ -244,3 +244,45 @@ fn a_stream_json_run_says_each_step_it_took() {
         "hi\nthere\n"
     );
 }
+
+#[test]
+fn a_print_run_in_a_session_answering_elsewhere_is_refused_and_leaves_it_be() {
+    let (data, work) = scratch("held");
+    let first = run(&data, &work, &["-p", "hello"]);
+    assert!(first.status.success());
+    let sessions = data.join("sessions");
+    let id = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            Some(name.strip_suffix(".jsonl")?.to_owned())
+        })
+        .unwrap();
+    let path = sessions.join(format!("{id}.jsonl"));
+    let before = std::fs::read(&path).unwrap();
+
+    // Its turn held as the phone's agent holds it, in a process of its own.
+    let turn = std::fs::File::create(sessions.join(format!("{id}.turn"))).unwrap();
+    turn.lock().unwrap();
+    std::fs::write(sessions.join(format!("{id}.who")), "phone").unwrap();
+    let out = run(&data, &work, &["-p", "-r", &id, "again"]);
+    let said =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    let refused =
+        format!("Session {id} is answering on your phone now; try again once it is done.");
+    assert!(said.contains(&refused), "{said}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Once that turn is done, the next run goes on from the file.
+    drop(turn);
+    let out = run(&data, &work, &["-p", "-r", &id, "again"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"again\""), "{text}");
+}

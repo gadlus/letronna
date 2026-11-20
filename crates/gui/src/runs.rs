@@ -4,7 +4,8 @@
 //! window's one turn or the view. The window stays the only writer of each
 //! session it holds: a run it starts works on a copy, in a transcript kept
 //! with the session's helpers, and when the run ends its new messages are
-//! applied to the session here and saved as a turn's are. A scheduled run
+//! applied to the session here and saved as a turn's are, the session's
+//! turn held from its prompt until then, as a turn's is. A scheduled run
 //! writes a new session of its own, which the sidebar lists as running, with
 //! its stop, while the window follows what the run writes there. A chat
 //! message for a session with a run going is left for that run as a `Later`
@@ -48,6 +49,10 @@ pub(crate) struct Run {
     /// Messages typed in its session while it runs, sent there as the next
     /// prompt once it is done.
     pub(crate) follow_ups: Vec<String>,
+    /// Its session's turn, held from its prompt until its end is saved, so
+    /// no other Letronna answers there meanwhile; None for a scheduled run,
+    /// whose session is a new one of its own.
+    turn: Option<letronna_core::store::TurnHold>,
 }
 
 /// A held run as its steps tell it, while its messages are still its own.
@@ -360,6 +365,16 @@ impl Chat {
             cx.notify();
             return Err(());
         }
+        // Held before anything is said, so the box keeps what was typed when
+        // another Letronna has started answering there.
+        let turn = match self.hold_session(ix, crate::app::SEND_AGAIN) {
+            Ok((turn, _)) => turn,
+            Err(why) => {
+                self.error = Some(why);
+                cx.notify();
+                return Err(());
+            }
+        };
         self.show_setup = None;
         self.store.pin(ix);
         let conversation = &mut self.store.conversations[ix];
@@ -375,7 +390,7 @@ impl Chat {
             ..Default::default()
         };
         self.error = None;
-        self.run_beside(id, message, None, None, cx);
+        self.start_beside(id, message, None, None, turn, cx);
         self.follow();
         Ok(())
     }
@@ -626,8 +641,45 @@ impl Chat {
             return;
         };
         // The run starts from what was said before, which a session let go
-        // of has to be read back for.
+        // of has to be read back for, here and elsewhere.
         self.fill_now(ix);
+        let turn = match self.hold_session(ix, crate::app::SEND_AGAIN) {
+            Ok((turn, _)) => turn,
+            Err(why) => {
+                let run = Run {
+                    label: self.store.conversations[ix].title.clone(),
+                    cancel: Cancel::default(),
+                    source,
+                    remote,
+                    held: true,
+                    queued: false,
+                    live: Live::default(),
+                    follow_ups: Vec::new(),
+                    turn: None,
+                };
+                let end = End {
+                    stopped: false,
+                    failed: true,
+                };
+                return self.ended(run, id, &format!("Did not start: {why}"), end, cx);
+            }
+        };
+        self.start_beside(id, message, source, remote, turn, cx);
+    }
+
+    /// `run_beside`, with session `id`'s turn held already, `turn`.
+    fn start_beside(
+        &mut self,
+        id: u64,
+        message: Message,
+        source: Option<Source>,
+        remote: Option<Remote>,
+        turn: letronna_core::store::TurnHold,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.
@@ -646,6 +698,7 @@ impl Chat {
             queued: true,
             live: Live::default(),
             follow_ups: Vec::new(),
+            turn: Some(turn),
         };
         self.runs.insert(id, run);
         self.start_queued(cx);
@@ -728,32 +781,49 @@ impl Chat {
         };
         let ends = self.run_ends.clone();
         let copy = path.clone();
-        let spawned = driver::spawn(spec, move |report| {
-            // Read back once the run is done with it, then let it go: the
-            // session keeps what it says.
-            let (added, todos) = Transcript::open(id, n)
-                .map(|mut read| {
-                    let messages = &mut read.conversation.messages;
-                    (
-                        messages.split_off(from.min(messages.len())),
-                        read.conversation.todos,
-                    )
-                })
-                .unwrap_or_default();
-            let _ = std::fs::remove_file(&copy);
-            let _ = ends.send_blocking(Finished {
-                session: id,
-                from,
-                added,
-                todos,
-                text: remote::said(report),
-                stopped: report.status == Outcome::Stopped,
-                failed: matches!(report.status, Outcome::Failed(_)),
+        let spawned = std::thread::Builder::new()
+            .name(format!("run-{id}"))
+            .spawn(move || {
+                // A run that panics still ends, so its session's turn is let go.
+                let ran =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::run(spec)));
+                let (text, stopped, failed) = match &ran {
+                    Ok(report) => (
+                        remote::said(report),
+                        report.status == Outcome::Stopped,
+                        matches!(report.status, Outcome::Failed(_)),
+                    ),
+                    Err(_) => (
+                        "The run stopped on an internal error.".to_owned(),
+                        false,
+                        true,
+                    ),
+                };
+                // Read back once the run is done with it, then let it go: the
+                // session keeps what it says.
+                let (added, todos) = Transcript::open(id, n)
+                    .map(|mut read| {
+                        let messages = &mut read.conversation.messages;
+                        (
+                            messages.split_off(from.min(messages.len())),
+                            read.conversation.todos,
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = std::fs::remove_file(&copy);
+                let _ = ends.send_blocking(Finished {
+                    session: id,
+                    from,
+                    added,
+                    todos,
+                    text,
+                    stopped,
+                    failed,
+                });
             });
-        });
         if let Err(error) = spawned {
             let _ = std::fs::remove_file(path);
-            return Err(error);
+            return Err(format!("Could not start the run: {error}"));
         }
         Ok(())
     }
@@ -780,6 +850,9 @@ impl Chat {
     /// What follows a held run's end: its answer to the chat that sent it,
     /// what came too late for it, and a place for the next.
     fn ended(&mut self, mut run: Run, id: u64, text: &str, end: End, cx: &mut Context<Self>) {
+        // Its end is saved, so its session's turn goes before anything that
+        // follows it there takes the turn again.
+        run.turn = None;
         // Files put back while it ran, told now the session is the window's
         // again and before a follow-up goes on.
         self.tell_waiting_put_back(id);
@@ -882,6 +955,7 @@ impl Chat {
             queued: false,
             live: Live::default(),
             follow_ups: Vec::new(),
+            turn: None,
         };
         self.runs.insert(started.session, run);
         cx.notify();
@@ -1018,6 +1092,7 @@ mod tests {
             queued: false,
             live: Default::default(),
             follow_ups: Vec::new(),
+            turn: None,
         }
     }
 

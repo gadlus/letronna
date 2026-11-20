@@ -37,6 +37,11 @@
 //! over the network, so they follow the reply that opens a session rather
 //! than hold it up. The editor's own MCP servers are not started: Letronna's
 //! are.
+//!
+//! One turn runs in a session at a time, wherever it is open: a session the
+//! window, a terminal or another agent is answering in is listed as busy and
+//! can be reopened and read, but a prompt there is refused until that turn
+//! ends, and a prompt that runs starts from the session's file as it is then.
 
 use crate::session::Runner;
 use letronna_core::approvals::{self, Decision, Request};
@@ -346,6 +351,9 @@ fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcri
         }
     };
     let mut transcript = Transcript { path, conversation };
+    // Before its first write, so it knows where it stands in its file from
+    // then on, and its turns can tell the file is still its own.
+    transcript.catch_up()?;
     transcript
         .save()
         .map_err(|e| format!("Could not write the new session: {e}"))?;
@@ -693,8 +701,11 @@ impl Agent {
             }
         };
         // Written now, so the session reopens on it even before its next
-        // turn; an early pick is written once its prompt settles it.
+        // turn; an early pick is written once its prompt settles it, and one
+        // made while another Letronna answers there once its next prompt
+        // here has caught up, rather than in among that turn's lines.
         if early.is_none()
+            && store::held_elsewhere(session).is_none()
             && let Err(e) = transcript.save()
         {
             eprintln!("Could not save the model picked for session {session}: {e}");
@@ -844,6 +855,7 @@ impl Agent {
                 let Ok((mut spec, unsettled)) = handed.recv() else {
                     return;
                 };
+                let settled = unsettled.is_some();
                 if let Some((before, picked)) = unsettled {
                     // Stopped while it waited: the prompt leaves nothing,
                     // and the pick is settled by the next one.
@@ -876,10 +888,31 @@ impl Agent {
                         send(&out, &failure(id, INVALID_REQUEST, &why));
                         return;
                     }
-                    // Settled, so written down as a listed pick is.
-                    if let Err(e) = spec.transcript.save() {
-                        eprintln!("Could not save the model picked for session {session}: {e}");
+                }
+                // Held from here to the turn's last save, so no other
+                // Letronna answers in the session meanwhile, and only after
+                // the wait for the gateways, which a turn elsewhere need not
+                // wait out. The turn starts from the file as it is now.
+                let who = match client {
+                    Client::Phone => "phone",
+                    Client::Editor => "editor",
+                };
+                let held = store::hold_turn(session, who)
+                    .map_err(|holder| answering_elsewhere(&holder, client))
+                    .and_then(|held| spec.transcript.catch_up().map(|_| held));
+                let held = match held {
+                    Ok(held) => held,
+                    Err(why) => {
+                        if let Some(open) = lock(&sessions).get_mut(&session) {
+                            open.transcript = Some(spec.transcript);
+                        }
+                        send(&out, &failure(id, INVALID_REQUEST, &why));
+                        return;
                     }
+                };
+                // Settled, so written down as a listed pick is.
+                if settled && let Err(e) = spec.transcript.save() {
+                    eprintln!("Could not save the model picked for session {session}: {e}");
                 }
                 // Only once the turn is sure to run, so a prompt ended
                 // unrun leaves nothing behind.
@@ -901,6 +934,7 @@ impl Agent {
                     }
                     None => false,
                 };
+                drop(held);
                 for call in std::mem::take(&mut *lock(&calls)) {
                     send(&out, &update(session, finished(&call, NEVER_RAN, true)));
                 }
@@ -1833,7 +1867,33 @@ fn info(session: &Summary) -> Option<Value> {
     if let Some(at) = updated.and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)) {
         info["updatedAt"] = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into();
     }
+    // How many messages it holds and how long its file is, which with
+    // `updatedAt`, to the second only, tell the phone whether it changed
+    // since it last looked, a rewind asked again within the second too.
+    let size = std::fs::metadata(store::sessions_dir().join(format!("{}.jsonl", session.id)))
+        .map_or(0, |file| file.len());
+    let mut letronna = json!({"messages": session.messages, "size": size});
+    // Answering in another Letronna now, which the phone shows and waits out.
+    if store::held_elsewhere(session.id).is_some() {
+        letronna["busy"] = true.into();
+    }
+    info["_meta"] = json!({"letronna": letronna});
     Some(info)
+}
+
+/// Why a prompt cannot run now: `who`, as `store::held_elsewhere` words it,
+/// is answering in its session in another Letronna, told as `client` hears it.
+fn answering_elsewhere(who: &str, client: Client) -> String {
+    let place = match (who, client) {
+        ("window", Client::Phone) => "at the desk",
+        ("window", Client::Editor) => "in the window",
+        ("terminal", _) => "in a terminal",
+        ("phone", _) => "on your phone",
+        ("editor", _) => "in an editor",
+        ("background", _) => "in the background",
+        _ => "elsewhere",
+    };
+    format!("This session is answering {place} now; try again once it is done.")
 }
 
 /// The options of `open` the editor can change: its model, among `models`,
@@ -3133,7 +3193,27 @@ mod tests {
         assert_eq!(sessions[0]["cwd"], here.display().to_string());
         assert_eq!(sessions[0]["title"], format!("Session {}", first + 1));
         assert_eq!(sessions[0]["updatedAt"], "1970-01-01T00:03:20Z");
+        let told = json!({"letronna": {"messages": 1, "size": size_of(first + 1)}});
+        assert_eq!(sessions[0]["_meta"], told);
         assert!(listed["result"].get("nextCursor").is_none());
+
+        // Rewound and asked again within the same second, as many messages
+        // as before: only its size tells the phone it changed.
+        saved(
+            first + 1,
+            &here,
+            200,
+            vec![said("user", "Second, asked again.")],
+        );
+        let again = editor.ask("session/list", json!({"cwd": here}));
+        let (_, listed_again) = editor.reply(again);
+        let changed = &listed_again["result"]["sessions"][0];
+        assert_eq!(changed["updatedAt"], sessions[0]["updatedAt"]);
+        assert_eq!(changed["_meta"]["letronna"]["messages"], 1);
+        assert_ne!(
+            changed["_meta"]["letronna"]["size"],
+            told["letronna"]["size"]
+        );
 
         // A full page says where the next starts, which holds the rest.
         let (page_one, next) = page(store::summaries(), Some(&here), None, 1);
@@ -3144,6 +3224,129 @@ mod tests {
         let bad = editor.ask("session/list", json!({"cursor": "somewhere"}));
         let (_, refused) = editor.reply(bad);
         assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// The length of session `id`'s file, as `session/list` gives it.
+    fn size_of(id: u64) -> u64 {
+        let path = store::sessions_dir().join(format!("{id}.jsonl"));
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    /// Session `id`'s turn held as another Letronna holds it, under `who`,
+    /// until the file given back is dropped: through a file of its own, which
+    /// this process's holds know nothing of.
+    fn held_by_another(id: u64, who: &str) -> std::fs::File {
+        let path = store::sessions_dir().join(format!("{id}.turn"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        file.lock().unwrap();
+        std::fs::write(path.with_extension("who"), who).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_session_answering_elsewhere_is_listed_busy_and_read_but_takes_no_prompt() {
+        let dir = scratch("held");
+        // Nothing to answer with: a prompt that reached the model would fail.
+        let mut editor = Editor::connect_as(provider(Vec::new()), SESSIONS + 450, Client::Phone);
+        let id = SESSIONS + 450;
+        let messages = vec![said("user", "Fix the bug."), said("assistant", "Fixed it.")];
+        saved(id, &dir, 100, messages);
+        saved(id + 1, &dir, 200, vec![said("user", "Another.")]);
+        let _desk = held_by_another(id, "window");
+
+        let list = editor.ask("session/list", json!({"cwd": dir}));
+        let (_, listed) = editor.reply(list);
+        let sessions = listed["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions[1]["sessionId"], id.to_string());
+        let busy = json!({"letronna": {"messages": 2, "size": size_of(id), "busy": true}});
+        assert_eq!(sessions[1]["_meta"], busy);
+        let free = json!({"letronna": {"messages": 1, "size": size_of(id + 1)}});
+        assert_eq!(sessions[0]["_meta"], free);
+
+        // Read as the file has it, which is no turn of its own.
+        let load = editor.ask(
+            "session/load",
+            json!({"sessionId": id.to_string(), "mcpServers": []}),
+        );
+        let (told, loaded) = editor.reply(load);
+        assert!(loaded.get("error").is_none());
+        let said_there = updates(&told, "agent_message_chunk");
+        assert_eq!(said_there[0]["content"]["text"], "Fixed it.");
+
+        let prompt = start(&mut editor, &id.to_string(), "Is it still fixed?");
+        let (_, refused) = editor.reply(prompt);
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST);
+        assert_eq!(
+            refused["error"]["message"],
+            "This session is answering at the desk now; try again once it is done."
+        );
+        assert_eq!(store::saved(id).unwrap().messages.len(), 2);
+    }
+
+    #[test]
+    fn a_prompt_once_the_turn_elsewhere_ends_takes_in_what_it_said() {
+        let dir = scratch("held-then");
+        let (endpoint, heard) = listening(vec![reply("Both are fixed.", &[])]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 460);
+        let id = SESSIONS + 460;
+        let messages = vec![said("user", "Fix the bug."), said("assistant", "Fixed it.")];
+        saved(id, &dir, 100, messages);
+        let load = editor.ask(
+            "session/load",
+            json!({"sessionId": id.to_string(), "cwd": dir, "mcpServers": []}),
+        );
+        editor.reply(load);
+        editor.until(|frame| frame["params"]["update"]["sessionUpdate"] == "config_option_update");
+
+        // A terminal's turn, which the editor's copy has not seen.
+        let terminal = held_by_another(id, "terminal");
+        let prompt = start(&mut editor, &id.to_string(), "Too soon?");
+        let (_, refused) = editor.reply(prompt);
+        assert_eq!(
+            refused["error"]["message"],
+            "This session is answering in a terminal now; try again once it is done."
+        );
+        // A model picked meanwhile is taken, and written with the next turn.
+        let path = store::sessions_dir().join(format!("{id}.jsonl"));
+        let before = std::fs::read(&path).unwrap();
+        let picked = pick_model(&mut editor, &id.to_string(), "Custom:other-model");
+        let (_, switched) = editor.reply(picked);
+        assert_eq!(
+            switched["result"]["configOptions"][0]["currentValue"],
+            "Custom:other-model"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut there = Transcript {
+            conversation: store::saved(id).unwrap(),
+            path: path.clone(),
+        };
+        let messages = &mut there.conversation.messages;
+        messages.push(said("user", "Fix the other bug."));
+        messages.push(said("assistant", "Fixed that too."));
+        there.save().unwrap();
+        drop(terminal);
+
+        let prompt = start(&mut editor, &id.to_string(), "Are both fixed?");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        let asked = heard.recv_timeout(WAIT).unwrap();
+        assert!(asked["messages"].to_string().contains("Fixed that too."));
+        assert_eq!(asked["model"], "other-model");
+        let saved = store::saved(id).unwrap();
+        assert_eq!(saved.model.as_deref(), Some("other-model"));
+        let back: Vec<&str> = saved.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(back.len(), 6);
+        assert_eq!(back[2..4], ["Fix the other bug.", "Fixed that too."]);
+        assert!(back[4].contains("Are both fixed?"));
+        assert_eq!(back[5], "Both are fixed.");
+        // Taken in, not saved over: the file never rewinds past them.
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(!file.contains("\"rewind\""));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 use letronna_core::history;
+use letronna_core::store::TurnHold;
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 actions!(turn_files, [ToggleDiff, ReviewFiles]);
@@ -115,6 +116,14 @@ enum RewindRow {
 /// How soon a second escape must follow the first to step to your newest
 /// message, as Claude Code's double escape opens its rewind.
 const TWICE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What a rewind, an edit or a retry says when the session went on in
+/// another Letronna since it was on screen here, and nothing was taken back.
+const WENT_ON: &str = "This session went on elsewhere meanwhile, so nothing was taken back. Look \
+     at what was said there, then try again.";
+
+/// What a rewind refused while another Letronna answers says to do then.
+const REWIND_AGAIN: &str = "rewind once it is done";
 
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
@@ -223,10 +232,25 @@ impl Chat {
             .join("\n\n")
     }
 
-    /// Cut the open session back to its first `keep` messages and save it.
-    fn cut_to(&mut self, keep: usize) {
+    /// Cut the open session back to its first `keep` messages and save it,
+    /// unless another Letronna is answering there or went on there since,
+    /// which is said instead. Gives the hold taken for the cut, if the
+    /// window's turn did not hold the session already.
+    fn cut_to(&mut self, keep: usize, then: &str) -> Result<Option<TurnHold>, String> {
         let ix = self.store.active;
         let id = self.store.conversations[ix].id;
+        // Held for the cut, after what was said elsewhere meanwhile, which a
+        // cut made from what was on screen would take back unseen.
+        let (held, went_on) = match (self.turn_hold.as_ref()).is_some_and(|(held, _)| *held == id) {
+            true => (None, self.store.conversations[ix].catch_up()?),
+            false => {
+                let (held, went_on) = self.hold_session(ix, then)?;
+                (Some(held), went_on)
+            }
+        };
+        if went_on {
+            return Err(WENT_ON.into());
+        }
         // A review of what is taken back must not keep any of it.
         self.stop_review(id);
         let conversation = &mut self.store.conversations[ix];
@@ -244,6 +268,7 @@ impl Chat {
         self.edited
             .retain(|&(session, at), _| session != id || at < keep);
         self.save();
+        Ok(held)
     }
 
     pub(crate) fn copy_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
@@ -300,8 +325,24 @@ impl Chat {
             return;
         }
         let images = self.prompt_images(at);
-        self.back_to(at, window, cx);
+        // Held from here through the turn it asks, and after what was said
+        // there elsewhere, which the edit would otherwise take back unseen.
+        let held = match self.hold_turn(self.store.active, crate::app::SEND_AGAIN) {
+            Ok(true) => Err(WENT_ON.to_owned()),
+            Ok(false) => self.back_to(at, window, cx),
+            Err(why) => Err(why),
+        };
+        if let Err(why) = held {
+            self.release_turn();
+            // Still open as changed, to send once it has been looked at.
+            self.editing_message = Some((session, at));
+            self.error = Some(why);
+            cx.notify();
+            return;
+        }
         self.ask_again(text, images, window, cx);
+        // A turn that did not start lets go of the session again.
+        self.release_turn();
     }
 
     /// Whether you asked anything after your message at `at`, which asking
@@ -315,16 +356,21 @@ impl Chat {
 
     /// Go back to just before your message at `at`, to ask it again. When
     /// you asked more after it, that stays: the asking goes to a fork.
-    fn back_to(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn back_to(
+        &mut self,
+        at: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         if !self.asked_after(at) {
-            self.cut_to(at);
-            return;
+            return self.cut_to(at, crate::app::SEND_AGAIN).map(drop);
         }
         self.fork_at(at, window, cx);
         window.push_notification(
             Notification::info("Asked in a fork. The original keeps what came after."),
             cx,
         );
+        Ok(())
     }
 
     /// Ask the turn's prompt again, dropping what came of it last time.
@@ -339,8 +385,20 @@ impl Chat {
             return;
         };
         let images = self.prompt_images(at);
-        self.back_to(at, window, cx);
+        // Held from here through the turn it asks, as for an edit.
+        let held = match self.hold_turn(self.store.active, crate::app::SEND_AGAIN) {
+            Ok(true) => Err(WENT_ON.to_owned()),
+            Ok(false) => self.back_to(at, window, cx),
+            Err(why) => Err(why),
+        };
+        if let Err(why) = held {
+            self.release_turn();
+            self.error = Some(why);
+            cx.notify();
+            return;
+        }
         self.ask_again(text, images, window, cx);
+        self.release_turn();
     }
 
     fn ask_again(
@@ -357,7 +415,7 @@ impl Chat {
             if self.run_saved(&text, asked, cx).is_err() {
                 self.composer
                     .update(cx, |input, cx| input.set_value(text, window, cx));
-                self.open_settings(window, cx);
+                self.not_sent(window, cx);
             }
             return;
         }
@@ -372,7 +430,7 @@ impl Chat {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));
-            self.open_settings(window, cx);
+            self.not_sent(window, cx);
         }
     }
 
@@ -554,14 +612,24 @@ impl Chat {
                             );
                             return;
                         }
-                        if restoring != Restoring::Code {
-                            this.cut_to(keep);
-                        }
+                        // Held for the cut and for the files, until they are
+                        // back and the model is told of them.
+                        let held = match restoring {
+                            Restoring::Code => this.hold_open(REWIND_AGAIN),
+                            _ => this.cut_to(keep, REWIND_AGAIN),
+                        };
+                        let held = match held {
+                            Ok(held) => held,
+                            Err(why) => {
+                                window.push_notification(Notification::warning(why), cx);
+                                return;
+                            }
+                        };
                         if restoring.files() && !files.is_empty() {
                             // Only the code alone leaves the edits in the
                             // conversation, which the model must hear of.
                             let tell = restoring == Restoring::Code;
-                            this.put_files_back(session, files.clone(), tell, window, cx);
+                            this.put_files_back(session, files.clone(), tell, held, window, cx);
                         }
                         if restoring != Restoring::Code {
                             this.give_back(session, back.clone(), images.clone());
@@ -642,6 +710,7 @@ impl Chat {
         session: u64,
         files: Vec<history::Restore>,
         tell: bool,
+        held: Option<TurnHold>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -669,8 +738,19 @@ impl Chat {
                 // The Changes tab and the status bar count what went back.
                 this.refresh_changes(cx);
             });
+            // The session's turn, held while its files went back and the
+            // model was told, goes now.
+            drop(held);
         })
         .detach();
+    }
+
+    /// Hold the open session's turn for a change made outside a turn, after
+    /// what was said there elsewhere meanwhile; or say who is answering
+    /// there, ending with `then`.
+    pub(crate) fn hold_open(&mut self, then: &str) -> Result<Option<TurnHold>, String> {
+        self.hold_session(self.store.active, then)
+            .map(|(held, _)| Some(held))
     }
 
     /// Tell `session`'s model which files `done` put back, with a notice
@@ -685,7 +765,9 @@ impl Chat {
             .or_default()
             .push(notice);
         let replying = self.streaming_id.filter(|_| self.busy);
-        if !put_back_waits(session, replying, self.runs.contains_key(&session)) {
+        let elsewhere = letronna_core::store::held_elsewhere(session).is_some();
+        let holds = self.runs.contains_key(&session) || elsewhere;
+        if !put_back_waits(session, replying, holds) {
             self.tell_waiting_put_back(session);
         }
     }
@@ -1442,8 +1524,14 @@ impl Chat {
                     .tooltip(undo_tip)
                     .disabled(self.busy || !undoable)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if !this.busy && this.store.conversations[this.store.active].id == session {
-                            this.put_files_back(session, files.clone(), true, window, cx);
+                        if this.busy || this.store.conversations[this.store.active].id != session {
+                            return;
+                        }
+                        match this.hold_open("undo them once it is done") {
+                            Ok(held) => {
+                                this.put_files_back(session, files.clone(), true, held, window, cx)
+                            }
+                            Err(why) => window.push_notification(Notification::warning(why), cx),
                         }
                     })),
             );
@@ -1833,11 +1921,12 @@ fn newest_yours(turns: &[Span]) -> Option<Span> {
 }
 
 /// Whether a notice of files put back must wait for `session`'s reply or
-/// run: in a reply under way it could land between a call and its result,
-/// and a run beside the chat leaves its work out of a session changed
-/// while it ran.
-fn put_back_waits(session: u64, replying: Option<u64>, run_holds: bool) -> bool {
-    replying == Some(session) || run_holds
+/// for what else holds it: in a reply under way it could land between a call
+/// and its result, a run beside the chat leaves its work out of a session
+/// changed while it ran, and another Letronna's turn would be saved over.
+/// It goes in at the window's next turn there.
+fn put_back_waits(session: u64, replying: Option<u64>, held: bool) -> bool {
+    replying == Some(session) || held
 }
 
 #[cfg(test)]

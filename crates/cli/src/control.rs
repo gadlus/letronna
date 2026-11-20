@@ -35,6 +35,7 @@ use letronna_core::driver::Report;
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::permissions::{self, Rule};
 use letronna_core::prompt_rules;
+use letronna_core::store::TurnHold;
 use letronna_core::tools;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -96,6 +97,8 @@ struct Running {
     prompt: Value,
     /// What it runs over, which its result line names the model and window of.
     connection: chat::Connection,
+    /// The session's turn, held until the turn's end is saved.
+    _held: TurnHold,
 }
 
 /// One line as `next_line` read it.
@@ -387,6 +390,9 @@ fn start(
     events: &Sender<Event>,
     timed: Option<(Instant, Instant)>,
 ) -> Result<Running, String> {
+    // Held from before the prompt goes on the session, which it then
+    // starts from as its file has it.
+    let held = runner.hold_turn(session, "terminal")?;
     let (mut spec, _, before) = crate::begin(runner, session, text, args, budget)?;
     // The turn times its replies against the run's deadline and is warned
     // before it, as -p's is.
@@ -402,6 +408,7 @@ fn start(
         cancel: spec.cancel.clone(),
         prompt: prompt_rules::seen(&spec.connection).unwrap_or_default(),
         connection: spec.connection.clone(),
+        _held: held,
     };
     let (events, output) = (events.clone(), args.output);
     std::thread::spawn(move || {
