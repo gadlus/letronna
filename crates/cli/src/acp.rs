@@ -3907,7 +3907,10 @@ mod tests {
     #[test]
     fn a_path_held_up_at_the_disk_is_answered_at_once_without_another_place() {
         let _serving = lock(&SERVING);
-        let (path, key) = ("/held/up", "list /held/up".to_owned());
+        // The key as `folders_reply` makes it, which on Windows turns the
+        // slashes round.
+        let path = "/held/up";
+        let key = format!("list {}", tidy(Path::new(path)).display());
         // Given up on, it keeps its place for as long as the disk holds it.
         let (let_go, held) = mpsc::channel::<()>();
         let quick = Duration::from_millis(50);
@@ -3933,7 +3936,7 @@ mod tests {
         // A recent folder is looked at without a place of its own, and
         // passed over at once while an earlier look at it is held up.
         let dir = scratch("held-up");
-        let look = Place::beside(format!("folder {}", dir.display()));
+        let look = Place::beside(format!("folder {}", tidy(&dir).display()));
         given_up(look.0);
         assert!(!still_there(&dir));
         drop(look);
