@@ -1031,6 +1031,12 @@ pub struct Bar {
     added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
+    /// The project's files the `@` picker looks among, read once per folder.
+    file_index: std::cell::OnceCell<Vec<String>>,
+    /// The last reference the picker was asked about, and what matched it.
+    file_matches: std::cell::RefCell<Option<(String, Vec<String>)>>,
+    /// The reference escape closed the picker on, kept closed until it changes.
+    files_dismissed: Option<String>,
     /// Whether what is sent at the prompt goes into the folder's history:
     /// only once the terminal at the prompt says so, so a box made for
     /// anything else -- a test among them -- writes none.
@@ -1143,6 +1149,9 @@ impl Bar {
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Added::default(),
             folder: None,
+            file_index: Default::default(),
+            file_matches: Default::default(),
+            files_dismissed: None,
             keep_history: false,
             private: false,
             searched: None,
@@ -1194,6 +1203,9 @@ impl Bar {
     pub fn set_folder(&mut self, folder: Option<std::path::PathBuf>) {
         if folder != self.folder {
             self.folder = folder;
+            self.file_index.take();
+            self.file_matches.get_mut().take();
+            self.files_dismissed = None;
             self.place.clear();
             self.look_at_place();
         }
@@ -2512,6 +2524,39 @@ impl Bar {
         self.done
     }
 
+    /// The project's files the `@` reference before the cursor matches, best
+    /// first, or none while anything else has the keys.
+    fn file_options(&self) -> Vec<String> {
+        if self.secret
+            || self.working
+            || self.asking.is_some()
+            || self.slider.is_some()
+            || self.choice.is_some()
+            || self.switches.is_some()
+            || self.line.text().starts_with(['!', '/'])
+        {
+            return Vec::new();
+        }
+        let (Some(folder), Some(query)) = (&self.folder, self.line.reference_before()) else {
+            return Vec::new();
+        };
+        if self.files_dismissed.as_ref() == Some(&query) {
+            return Vec::new();
+        }
+        let mut cached = self.file_matches.borrow_mut();
+        if let Some((previous, matches)) = cached.as_ref()
+            && previous == &query
+        {
+            return matches.clone();
+        }
+        let index = self
+            .file_index
+            .get_or_init(|| letronna_core::references::project_files(folder));
+        let matches = letronna_core::references::rank_files(index, &query, MENU_LIMIT);
+        *cached = Some((query, matches.clone()));
+        matches
+    }
+
     fn key(&mut self, key: KeyEvent) {
         // Windows reports press and release; act on one of them.
         if key.kind != KeyEventKind::Press {
@@ -2569,6 +2614,32 @@ impl Bar {
                 vim.settle(&mut self.line);
             }
             return;
+        }
+        let files = self.file_options();
+        if !files.is_empty() && key.modifiers.is_empty() {
+            let picked = self.picked.min(files.len() - 1);
+            match key.code {
+                KeyCode::Up => self.picked = (picked + files.len() - 1) % files.len(),
+                KeyCode::Down => self.picked = (picked + 1) % files.len(),
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.line
+                        .replace_reference(&format!("{} ", files[picked].replace(' ', "\\ ")));
+                    self.picked = 0;
+                }
+                KeyCode::Esc => self.files_dismissed = self.line.reference_before(),
+                _ => {
+                    self.files_dismissed = None;
+                    self.picked = 0;
+                }
+            }
+            if matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc
+            ) {
+                return;
+            }
+        } else if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.files_dismissed = None;
         }
         let options = menu_for(&self.line, &self.added);
         match key.code {
@@ -3302,6 +3373,21 @@ impl Bar {
             }
         }
 
+        let files = self.file_options();
+        for (i, file) in files.iter().enumerate() {
+            let selected = i == self.picked.min(files.len() - 1);
+            let name = render::fit(
+                file,
+                render::width().saturating_sub(render::GUTTER.len() + 2),
+            );
+            let (marker, name) = if selected {
+                ("›", render::blue(&name))
+            } else {
+                (" ", name)
+            };
+            lines.push(format!("{}{marker} {name}", render::GUTTER));
+        }
+
         let back = crate::screen::scrolled();
         let helpers = at_work(self.relay.len());
         // Cut rather than wrapped, now the count makes it longer: a wrapped
@@ -3339,6 +3425,8 @@ impl Bar {
             // What the command being given its words does, while they are
             // typed, where the menu has gone.
             blurb.to_owned()
+        } else if !files.is_empty() {
+            "↑↓ to choose  ·  enter or tab to insert  ·  esc to dismiss".to_owned()
         } else if self.working && self.sendable() > 0 {
             "ctrl-s to send now  ·  ↑ to take it back  ·  esc to stop".to_owned()
         } else if self.working {
@@ -4509,6 +4597,25 @@ mod tests {
         for ch in text.chars() {
             hit(bar, KeyCode::Char(ch), KeyModifiers::NONE);
         }
+    }
+
+    #[test]
+    fn file_picker_inserts_a_nested_match_without_sending() {
+        let mut bar = Bar::new(String::new());
+        bar.folder = Some(std::path::PathBuf::from("."));
+        bar.file_index
+            .set(vec!["src/main.rs".into(), "nested/main copy.rs".into()])
+            .unwrap();
+        type_keys(&mut bar, "look at @main");
+        assert!(
+            bar.lines(40)
+                .iter()
+                .any(|line| line.contains("nested/main copy.rs"))
+        );
+        hit(&mut bar, KeyCode::Down, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "look at @nested/main\\ copy.rs ");
+        assert!(bar.queued.is_empty());
     }
 
     #[test]
