@@ -433,12 +433,26 @@ const PLAN_CARD: &str = "Made on your ChatGPT plan, counted toward its image lim
 /// names decides nothing here: which of the two is the user's choice, and
 /// only one of them costs.
 fn plan_for(connection: Option<&Connection>) -> Option<images::Plan> {
-    let plan = images::plan(connection)?;
-    if !crate::auth::signed_in() {
-        return Some(plan);
+    let picked = choices();
+    image_plan(connection, picked.get("image").map(String::as_str))
+}
+
+/// Whether this image selection uses a ChatGPT plan instead of hosted credit.
+pub fn image_uses_chatgpt(endpoint: &str, model: Option<&str>) -> bool {
+    let connection = Connection {
+        endpoint: endpoint.to_owned(),
+        ..Default::default()
+    };
+    image_plan(Some(&connection), model).is_some()
+}
+
+/// The plan `plan_for` picks, with `model` the image model picked in the
+/// model menu, `None` for Auto.
+fn image_plan(connection: Option<&Connection>, model: Option<&str>) -> Option<images::Plan> {
+    if !crate::auth::signed_in() || (model.is_none() && connection.is_some_and(images::chats_on)) {
+        return images::plan(connection);
     }
-    let on_plan = connection.is_some_and(images::chats_on);
-    (on_plan && !choices().contains_key("image")).then_some(plan)
+    None
 }
 
 /// Make the picture `prompt` describes on `plan`, and save it as any made
@@ -2614,6 +2628,9 @@ mod tests {
         // The chat's own plan covers it, and a chat anywhere else is paid
         // for as it always was.
         assert!(plan_for(Some(&chat)).is_some());
+        assert!(image_uses_chatgpt(&chat.endpoint, None));
+        assert!(!image_uses_chatgpt(&chat.endpoint, Some("flux.2-pro")));
+        assert!(!image_uses_chatgpt(&letronna.endpoint, None));
         assert!(plan_for(Some(&letronna)).is_none() && plan_for(None).is_none());
         assert_eq!(MakeImage.description_for(&chat, &[]), ON_PLAN);
         assert_eq!(

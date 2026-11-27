@@ -94,12 +94,24 @@ impl Chat {
         letronna_core::gateway::free_today(gateway, model, self.account.as_ref())
     }
 
+    /// Whether a picture of `kind` made with `model` in the active chat goes
+    /// to a ChatGPT plan, which needs no credit, rather than a hosted model.
+    fn image_uses_chatgpt(&self, kind: &str, model: Option<&str>) -> bool {
+        if kind != "image" {
+            return false;
+        }
+        let (gateway, _) = self.store.model(self.store.active);
+        let endpoint =
+            letronna_core::gateway::base_url(gateway, &self.store.settings.custom_endpoint);
+        letronna_core::media::image_uses_chatgpt(&endpoint, model)
+    }
+
     /// Whether the media model `model` of `kind`, or the cheapest working
     /// for `None`, cannot be paid for: the account has no plan or credit,
     /// and no perk makes it free today. The cheapest working is not, as it
     /// is picked among them all.
     pub(crate) fn media_locked(&self, kind: &str, model: Option<&str>) -> bool {
-        if !self.hosted_unpaid(LETRONNA) {
+        if self.image_uses_chatgpt(kind, model) || !self.hosted_unpaid(LETRONNA) {
             return false;
         }
         let Some(model) = model else {
@@ -618,8 +630,7 @@ impl Chat {
     ) -> Stateful<Div> {
         let kind = self.model_kind;
         let chosen = self.media_choices.get(kind);
-        // Media is made on the hosted models alone, and those a perk makes
-        // free today are the only ones open without a plan or credit.
+        // The upgrade notice applies to hosted models, not ChatGPT plan images.
         if self.hosted_unpaid(LETRONNA) {
             list = list.child(
                 h_flex()
@@ -635,7 +646,7 @@ impl Chat {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Needs a subscription"),
+                            .child("Hosted models need a subscription"),
                     )
                     .child(upgrade_button("media-upgrade", cx)),
             );
@@ -654,9 +665,12 @@ impl Chat {
         for (i, (pick, name, note)) in auto.chain(offers).enumerate() {
             let active = pick.as_ref() == chosen;
             let unpaid = self.media_locked(kind, pick.as_deref());
-            let note = match self.hosted_unpaid(LETRONNA) && !unpaid {
-                true => "Free today".to_owned(),
-                false => note,
+            let note = if self.image_uses_chatgpt(kind, pick.as_deref()) {
+                "ChatGPT plan".to_owned()
+            } else if self.hosted_unpaid(LETRONNA) && !unpaid {
+                "Free today".to_owned()
+            } else {
+                note
             };
             list = list.child(
                 Button::new(("media-model", i))

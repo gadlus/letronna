@@ -2208,8 +2208,7 @@ impl Chat {
         let making = self.making(&prompt, from_chat_app);
         // Asking anything at all means the setup page has done its job.
         self.show_setup = None;
-        // Sent, it would only be refused for want of a plan or credit. Media
-        // is made on the hosted models whatever the session's gateway.
+        // Sent, it would only be refused for want of a plan or credit.
         if self.locked_for(making) {
             self.error = Some(self.upgrade_note_for(making));
             cx.notify();
