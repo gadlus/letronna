@@ -25,6 +25,10 @@ const ASIDE: &str = "btw-";
 /// process is gone, while a younger one may be another process's, running.
 const ASIDE_STALE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// What catching up says of a session another process deleted, whose id a
+/// new session may have taken since.
+const DELETED_ELSEWHERE: &str = "This session was deleted elsewhere.";
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Conversation {
     /// Stable identity, so a streaming reply lands in the session it was sent
@@ -103,10 +107,11 @@ pub struct Conversation {
     #[serde(skip)]
     pub summary_saved: bool,
     /// Where this copy stands in its file, so what another process adds
-    /// there can be told apart and followed. Set by reading the file and
-    /// kept by saving; a copy without it, as the terminal's are, is saved
-    /// blind to the other's lines, as before. Only the store should touch
-    /// it; it is visible for the same reason as `flushed`.
+    /// there can be told apart and followed. Set by reading the file, a
+    /// fill by `filled_with_seen` included, and kept by saving; a copy
+    /// without it, as one filled otherwise is, or one started here until it
+    /// first catches up, is saved blind to the other's lines. Only the store
+    /// should touch it; it is visible for the same reason as `flushed`.
     #[serde(skip)]
     pub seen: Option<Seen>,
     /// Set when a save found another process had added messages here too,
@@ -926,6 +931,25 @@ impl Conversation {
         self.flushed = self.messages.len();
     }
 
+    /// `filled_with`, marking too where the read stood in the file, so what
+    /// another process adds from here is caught up on rather than saved over
+    /// blind, and taking the descriptive fields the file had then.
+    pub fn filled_with_seen(&mut self, contents: Contents, stood: Stood) {
+        if !self.unfilled() {
+            return;
+        }
+        self.filled_with(contents);
+        self.seen = stood.seen;
+        // The listing can be older than the file, renamed or pinned since in
+        // another process: the file's fields stand, with what this copy
+        // changed since the listing laid over them, or the next save would
+        // write the listing's back.
+        let written = self.written.clone().unwrap_or_else(|| stood.meta.clone());
+        let laid = laid_over(stood.meta.clone(), &written, self.meta());
+        self.play(Record::Meta(laid), &mut Vec::new());
+        self.written = Some(stood.meta);
+    }
+
     /// Let go of the messages, which `fill` reads back when they are wanted
     /// again. Only a session with all of it on disk can; false otherwise.
     pub fn unload(&mut self) -> bool {
@@ -1222,13 +1246,17 @@ impl Store {
 
     /// Forget a session and remove its file, its helpers' conversations,
     /// the copies kept of the files it wrote, and its lock file if it can
-    /// take the lock.
-    pub fn remove(&mut self, index: usize) {
-        if index >= self.conversations.len() {
-            return;
+    /// take the lock; unless a turn is answering in it, here or in another
+    /// Letronna (`held_elsewhere` says who), when it stays. Whether it went.
+    pub fn remove(&mut self, index: usize) -> bool {
+        let Some(gone) = self.conversations.get(index) else {
+            return false;
+        };
+        let erased = erase(gone.id, Lock::take(&session_path(gone.id)).ok());
+        if erased {
+            self.conversations.remove(index);
         }
-        let gone = self.conversations.remove(index);
-        erase(gone.id, Lock::take(&session_path(gone.id)).ok());
+        erased
     }
 
     /// Take in what another process wrote to the sessions since this one
@@ -1260,13 +1288,24 @@ impl Store {
     }
 }
 
-/// Remove session `id`'s file and what is kept beside it for it. Its lock
+/// Remove session `id`'s file and what is kept beside it for it, unless a
+/// turn holds it, here or in another process; whether it went. Its lock
 /// file goes only with `lock` held on it.
-fn erase(id: u64, lock: Option<Lock>) {
+fn erase(id: u64, lock: Option<Lock>) -> bool {
+    let path = session_path(id);
+    // Before anything goes: a turn answering in it would write it back as
+    // a fragment, or go on into nothing.
+    if held_here(id).is_some() {
+        return false;
+    }
+    let turn = match take_turn(&path.with_extension("turn"), || std::thread::sleep(TRY_GAP)) {
+        Ok(turn) => Some(turn),
+        Err(Untaken::Unlockable) => None,
+        Err(Untaken::Held | Untaken::Stuck) => return false,
+    };
     // First, so a helper still at work stops, and what it was writing
     // is not left behind in the folder that goes next.
     crate::agents::forget(id);
-    let path = session_path(id);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::prefilter::path_for(&path));
     // A lock file someone else holds stays: removed, the next writer
@@ -1274,6 +1313,12 @@ fn erase(id: u64, lock: Option<Lock>) {
     if lock.is_some() {
         let _ = std::fs::remove_file(path.with_extension("lock"));
     }
+    // The turn's files likewise, removed while the turn is taken here.
+    if turn.is_some() {
+        let _ = std::fs::remove_file(path.with_extension("turn"));
+        let _ = std::fs::remove_file(path.with_extension("who"));
+    }
+    drop(turn);
     let _ = std::fs::remove_dir_all(helpers_dir(id));
     let _ = std::fs::remove_dir_all(crate::tools::results_dir(id));
     let _ = std::fs::remove_dir_all(crate::memory::chat_folder(id));
@@ -1290,6 +1335,7 @@ fn erase(id: u64, lock: Option<Lock>) {
     let _ = crate::wake::cancel(id);
     #[cfg(feature = "workflows")]
     crate::script::forget(id);
+    true
 }
 
 /// The file marking when old sessions were last looked for.
@@ -1379,8 +1425,9 @@ fn prune(keep_days: u32, now: u64, open: &[u64]) -> Vec<u64> {
         let Ok(lock) = Lock::take(&path) else {
             continue;
         };
-        erase(summary.id, Some(lock));
-        deleted.push(summary.id);
+        if erase(summary.id, Some(lock)) {
+            deleted.push(summary.id);
+        }
     }
     deleted
 }
@@ -1467,20 +1514,29 @@ impl Conversation {
             .read(true)
             .open(path)?;
         // How many of the messages this copy wrote the other process left,
-        // when it wrote here since this copy was read or written.
+        // when it wrote here since this copy was read or written, and the
+        // descriptive fields it wrote meanwhile.
+        let mut their_meta = None;
         let standing = match &self.seen {
             Some(seen) => match added_since(&mut file, seen)? {
-                Some(theirs) => kept_by(&theirs, self.flushed),
+                Some(theirs) => {
+                    their_meta = last_meta(&theirs);
+                    kept_by(&theirs, self.flushed)
+                }
                 None => {
                     let had = &self.messages[..self.flushed.min(self.messages.len())];
                     // Replaced under this copy, as when a new session took
                     // the freed id: writing on would put this one's lines in
                     // it. Rewritten by the other's rewind, it is still this
                     // session, holding what the two share.
-                    let Some(shared) = rewritten(&std::fs::read(path)?, seen.head, had) else {
+                    let bytes = std::fs::read(path)?;
+                    let Some(shared) = rewritten(&bytes, seen.head, had) else {
                         self.gone = true;
                         return Ok(());
                     };
+                    // A rename there stands under this copy's own, as when
+                    // the file was only added to.
+                    their_meta = last_meta(&bytes);
                     Some(shared)
                 }
             },
@@ -1501,6 +1557,16 @@ impl Conversation {
             self.rewound = Some(to);
             self.diverged = true;
         }
+        // A rename or a pin made there meanwhile stands, with only what this
+        // copy changed since it last wrote laid over it.
+        let (meta, meta_changed) = match (their_meta, &self.written) {
+            (Some(theirs), Some(written)) => {
+                let laid = laid_over(theirs.clone(), written, meta);
+                let changed = laid != theirs;
+                (laid, changed)
+            }
+            _ => (meta, meta_changed),
+        };
         // Theirs may have come after this copy's, so this copy's go again.
         let meta_changed = meta_changed || clash;
         let summary_new = summary_new || (clash && self.summary.is_some());
@@ -1582,6 +1648,8 @@ impl Conversation {
         }
         self.flushed = self.messages.len();
         self.decided = self.decisions.len();
+        // Their fields laid in are this copy's now too.
+        self.play(Record::Meta(meta.clone()), &mut Vec::new());
         self.written = Some(meta);
         self.rewound = None;
         self.summary_saved = true;
@@ -1731,6 +1799,79 @@ impl Conversation {
     /// read or written: only the lines added, when the file just grew, and
     /// all of it again when it was replaced. Whether anything changed.
     fn follow(&mut self) -> bool {
+        self.follow_at(&session_path(self.id), false)
+    }
+
+    /// Take in what another process appended to this session's file since
+    /// this copy last read or wrote it, so a turn starts from the file and
+    /// not from a stale copy; whether anything was taken in.
+    pub fn catch_up(&mut self) -> Result<bool, String> {
+        self.catch_up_at(&session_path(self.id))
+    }
+
+    /// `catch_up` with the file at `path`.
+    ///
+    /// Descriptive fields changed here and not saved yet, such as a model
+    /// just picked, stay this copy's, laid over the file's. Anything else
+    /// not saved yet -- messages, a rewind, decisions, a summary -- is
+    /// refused once the file has moved, as saving it would cut the other's
+    /// turn and dropping it would lose this copy's; until then the caller's
+    /// next save writes it as it is. A copy never written yet is marked as
+    /// standing before the file's first byte, so its first write marks
+    /// where it then stands.
+    fn catch_up_at(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        let Some(written) = self.written.clone() else {
+            self.seen.get_or_insert_with(Seen::at_start);
+            return Ok(false);
+        };
+        // Listed and not read in, it is read whole when it is opened.
+        if self.unfilled() {
+            return Ok(false);
+        }
+        let stat = std::fs::metadata(path);
+        let deleted = (stat.as_ref()).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if self.gone || deleted {
+            return Err(DELETED_ELSEWHERE.into());
+        }
+        let unsaved = self.flushed != self.messages.len()
+            || self.decided != self.decisions.len()
+            || self.rewound.is_some()
+            || (self.summary.is_some() && !self.summary_saved);
+        if unsaved {
+            let still = stat.is_ok_and(|stat| {
+                (self.seen)
+                    .is_some_and(|seen| (stat.len(), modified(&stat)) == (seen.size, seen.mtime))
+            });
+            return match still {
+                true => Ok(false),
+                false => Err(
+                    "This session changed elsewhere while what was said here was not saved yet."
+                        .into(),
+                ),
+            };
+        }
+        // Following takes no copy with something unsaved, so what was
+        // changed here is set aside while the file's lines are played, then
+        // laid over what they say.
+        let mine = self.meta();
+        self.play(Record::Meta(written.clone()), &mut Vec::new());
+        let changed = self.follow_at(path, true);
+        let theirs = self.meta();
+        self.play(
+            Record::Meta(laid_over(theirs, &written, mine)),
+            &mut Vec::new(),
+        );
+        // Its id was given to another session since.
+        if self.gone {
+            return Err(DELETED_ELSEWHERE.into());
+        }
+        Ok(changed)
+    }
+
+    /// `follow` with the file at `path`. When `checked`, a file read again
+    /// in full is first checked to be this session still, by its head, and
+    /// one that is not marks this copy gone.
+    fn follow_at(&mut self, path: &std::path::Path, checked: bool) -> bool {
         let unsaved = self.flushed != self.messages.len()
             || self.decided != self.decisions.len()
             || self.rewound.is_some()
@@ -1742,14 +1883,13 @@ impl Conversation {
         if self.written.is_none() || (self.counted > 0 && self.messages.is_empty()) || unsaved {
             return false;
         }
-        let path = session_path(self.id);
         // Gone, the next save knows not to bring it back.
-        let Ok(stat) = std::fs::metadata(&path) else {
+        let Ok(stat) = std::fs::metadata(path) else {
             return false;
         };
         let (size, mtime) = (stat.len(), modified(&stat));
         let Some(seen) = self.seen else {
-            return self.read_again(&path);
+            return self.read_again(path, None);
         };
         if (size, mtime) == (seen.size, seen.mtime) {
             return false;
@@ -1757,11 +1897,11 @@ impl Conversation {
         // Only a copy that is still what the mark was taken of can be carried
         // on from it; one read in again some other way since is read afresh.
         let resumed = (self.messages.len() == seen.messages)
-            .then(|| std::fs::File::open(&path).ok())
+            .then(|| std::fs::File::open(path).ok())
             .flatten()
             .and_then(|mut file| read_on(&mut file, seen.len, seen.tail, size).ok().flatten());
         let Some((from, start, bytes)) = resumed else {
-            return self.read_again(&path);
+            return self.read_again(path, checked.then_some(seen.head));
         };
         let mut summaries = self.holding();
         let taken = start + self.apply(&bytes[start..], &mut summaries);
@@ -1779,12 +1919,61 @@ impl Conversation {
     }
 
     /// Replace this copy with its file as it is now; whether there was one.
-    fn read_again(&mut self, path: &std::path::Path) -> bool {
+    /// A file whose first line no longer hashes to `head` is another session
+    /// given this one's freed id, and leaves this copy gone instead.
+    fn read_again(&mut self, path: &std::path::Path, head: Option<u64>) -> bool {
         let Some(read) = replay(path) else {
             return false;
         };
+        if head.is_some_and(|head| read.seen.is_some_and(|seen| seen.head != head)) {
+            self.gone = true;
+            return false;
+        }
         *self = read;
         true
+    }
+}
+
+/// `theirs`, the descriptive fields as the file has them now, with each one
+/// this copy changed since it last wrote them, `then`, set to this copy's,
+/// `mine`: a model with the gateway it is on, and a folder with the
+/// worktree it is in, as one.
+fn laid_over(theirs: Meta, then: &Meta, mine: Meta) -> Meta {
+    fn pick<T: PartialEq>(theirs: T, then: &T, mine: T) -> T {
+        if mine == *then { theirs } else { mine }
+    }
+    let (model, gateway) = pick(
+        (theirs.model, theirs.gateway),
+        &(then.model.clone(), then.gateway.clone()),
+        (mine.model, mine.gateway),
+    );
+    let (workspace, worktree) = pick(
+        (theirs.workspace, theirs.worktree),
+        &(then.workspace.clone(), then.worktree.clone()),
+        (mine.workspace, mine.worktree),
+    );
+    Meta {
+        title: pick(theirs.title, &then.title, mine.title),
+        updated: pick(theirs.updated, &then.updated, mine.updated),
+        pinned: pick(theirs.pinned, &then.pinned, mine.pinned),
+        workspace,
+        todos: pick(theirs.todos, &then.todos, mine.todos),
+        model,
+        gateway,
+        effort: pick(theirs.effort, &then.effort, mine.effort),
+        goal: pick(theirs.goal, &then.goal, mine.goal),
+        imported_from: pick(
+            theirs.imported_from,
+            &then.imported_from,
+            mine.imported_from,
+        ),
+        worktree,
+        memory_saving: pick(
+            theirs.memory_saving,
+            &then.memory_saving,
+            mine.memory_saving,
+        ),
+        memory_scope: pick(theirs.memory_scope, &then.memory_scope, mine.memory_scope),
     }
 }
 
@@ -2085,6 +2274,15 @@ impl Transcript {
         }
         self.conversation.flush_to(&self.path)
     }
+
+    /// Take in what another process appended to the file, as a session's
+    /// `catch_up` does; one kept in memory only has nothing to take in.
+    pub fn catch_up(&mut self) -> Result<bool, String> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        self.conversation.catch_up_at(&self.path)
+    }
 }
 
 /// What a session looks like from the outside: enough to recognise it by,
@@ -2197,6 +2395,21 @@ pub struct Seen {
     /// A hash of the file's first line, its head, which a rewind's rewrite
     /// keeps and a new session given the same id does not.
     head: u64,
+}
+
+impl Seen {
+    /// Where a copy stands that has read none of its file: before its first
+    /// byte.
+    fn at_start() -> Self {
+        Seen {
+            size: 0,
+            mtime: 0,
+            len: 0,
+            tail: tail_hash(&[]),
+            messages: 0,
+            head: head_hash(&[]),
+        }
+    }
 }
 
 fn index_path() -> PathBuf {
@@ -2504,7 +2717,9 @@ fn added_since(file: &mut std::fs::File, seen: &Seen) -> std::io::Result<Option<
 
 /// How many of the first `had` messages survive `bytes`, lines another
 /// process added to the file: all of them, or fewer after a rewind there.
-/// None when the lines hold no whole record, as a write cut short leaves.
+/// None when the lines say nothing of the messages or what goes with them
+/// -- only descriptive fields, laid over rather than clashed with, or a
+/// write cut short.
 fn kept_by(bytes: &[u8], had: usize) -> Option<usize> {
     let end = whole_lines(bytes);
     let mut standing = None;
@@ -2514,6 +2729,10 @@ fn kept_by(bytes: &[u8], had: usize) -> Option<usize> {
             standing = standing.or(Some(had));
             continue;
         }
+        // A rename or a pin, and the usage a rewind there kept.
+        if line.starts_with("{\"type\":\"meta\"") || line.starts_with("{\"type\":\"paid\"") {
+            continue;
+        }
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Rewind { to }) => standing = Some(standing.unwrap_or(had).min(to)),
             Ok(_) => standing = standing.or(Some(had)),
@@ -2521,6 +2740,20 @@ fn kept_by(bytes: &[u8], had: usize) -> Option<usize> {
         }
     }
     standing
+}
+
+/// The descriptive fields the last meta line among `bytes`' whole lines
+/// gives, if there is one.
+fn last_meta(bytes: &[u8]) -> Option<Meta> {
+    let end = whole_lines(bytes);
+    String::from_utf8_lossy(&bytes[..end])
+        .lines()
+        .rev()
+        .filter(|line| line.starts_with("{\"type\":\"meta\""))
+        .find_map(|line| match serde_json::from_str(line) {
+            Ok(Record::Meta(meta)) => Some(meta),
+            _ => None,
+        })
 }
 
 /// Where a copy stands that has just written the end of the file, holding
@@ -3320,6 +3553,207 @@ impl Drop for Lock {
     }
 }
 
+/// A session's turn, held by this process while it answers there, so no
+/// other process starts one in it meanwhile.
+///
+/// The window, a terminal and the phone's agent can all have one session
+/// open, and each copy that answers saves its turn over whatever the others
+/// appended meanwhile. So a turn holds the operating system's lock on
+/// `sessions/<id>.turn` from before its prompt is taken until its last save,
+/// and another process asking is told who has it rather than kept waiting.
+/// It is not the session's `.lock`, held for one append: locks are per open
+/// file, so this process's own saves would then wait on its turn. Who holds
+/// it is written beside it in `<id>.who`, as Windows lets nobody else read a
+/// file while it is locked.
+pub struct TurnHold {
+    id: u64,
+    /// The locked file, or None for a turn on a disk that cannot lock.
+    file: Option<std::fs::File>,
+}
+
+impl TurnHold {
+    /// Whether the turn is held, rather than run unheld on a disk or in a
+    /// folder that cannot lock.
+    pub fn held(&self) -> bool {
+        self.file.is_some()
+    }
+}
+
+/// The sessions whose turn this process holds, each with the word it holds
+/// it under, so it never reads its own hold as one elsewhere and refuses a
+/// second without asking the system.
+static HELD: std::sync::Mutex<std::collections::BTreeMap<u64, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How many times a turn file's lock is tried, past looks that share it
+/// for a moment and failures that pass: a look is a few system calls long,
+/// so the tries outlast any run of them.
+const TRIES: usize = 40;
+
+/// How long a take of a turn file's lock waits between tries, short enough
+/// that all of them together are less than a person notices.
+const TRY_GAP: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Hold session `id`'s turn for this process, as `who` ("window",
+/// "terminal", "phone", "editor" or "background"), until the hold is
+/// dropped; or give, as a bare word for the caller to put in its own words,
+/// whoever holds it now.
+///
+/// A disk or folder that cannot lock leaves the turn unheld, as before
+/// there were holds, which `TurnHold::held` says; this process still holds
+/// it for itself.
+pub fn hold_turn(id: u64, who: &str) -> Result<TurnHold, String> {
+    // This process's own, looked at here and recorded once taken, so the
+    // record is not held over the tries.
+    if let Some(word) = held_here(id) {
+        return Err(word);
+    }
+    // A `--bg` run writes the session for as long as it runs.
+    if crate::background::running(id) && !crate::background::ours(id) {
+        return Err("background".into());
+    }
+    let _ = std::fs::create_dir_all(sessions_dir());
+    let path = session_path(id).with_extension("turn");
+    let file = match take_turn(&path, || std::thread::sleep(TRY_GAP)) {
+        Ok(file) => Some(file),
+        Err(Untaken::Held) => return Err(holder(id)),
+        Err(Untaken::Stuck) => return Err("elsewhere".into()),
+        Err(Untaken::Unlockable) => {
+            crate::diag::event("turn_unheld", &[]);
+            None
+        }
+    };
+    let mut held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Held by another thread here meanwhile, as an unheld turn can be.
+    if let Some(word) = held.get(&id) {
+        return Err(word.clone());
+    }
+    if file.is_some() {
+        let _ = std::fs::write(path.with_extension("who"), who);
+    }
+    held.insert(id, who.to_owned());
+    Ok(TurnHold { id, file })
+}
+
+/// The word this process holds session `id`'s turn under, if it does.
+fn held_here(id: u64) -> Option<String> {
+    let held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.get(&id).cloned()
+}
+
+/// Who holds session `id`'s turn in another process, in its own word, or
+/// "background" while a `--bg` run works in it; None when nobody else does.
+pub fn held_elsewhere(id: u64) -> Option<String> {
+    let held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.contains_key(&id) {
+        return None;
+    }
+    let path = session_path(id).with_extension("turn");
+    // Shared, so two looks at once never take each other for a turn.
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let _ = file.unlock();
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Some(holder(id)),
+            Err(std::fs::TryLockError::Error(_)) => {}
+        }
+    }
+    drop(held);
+    let running = crate::background::running(id) && !crate::background::ours(id);
+    running.then(|| "background".into())
+}
+
+/// The word session `id`'s turn is held under: "elsewhere" in the moment
+/// between a hold and its word, or when the word cannot be read.
+fn holder(id: u64) -> String {
+    let word = std::fs::read_to_string(session_path(id).with_extension("who")).unwrap_or_default();
+    match word.trim() {
+        "" => "elsewhere".into(),
+        word => word.into(),
+    }
+}
+
+/// Why a turn file's lock was not taken.
+enum Untaken {
+    /// A turn holds it.
+    Held,
+    /// Looks shared it at every try, as they never do for long.
+    Stuck,
+    /// The disk or folder cannot lock it: it said so, or failed every try.
+    Unlockable,
+}
+
+/// Open the turn file at `path` and take its lock alone, unless a turn
+/// holds it, with `between` run between tries. A look from
+/// `held_elsewhere` shares it for a moment, which is no turn, and a lock or
+/// an open can fail for a moment too, so both are tried again; one that
+/// fails every time, as on a disk without locking, is taken for one that
+/// cannot lock.
+fn take_turn(path: &std::path::Path, mut between: impl FnMut()) -> Result<std::fs::File, Untaken> {
+    use std::fs::TryLockError::{Error, WouldBlock};
+    let lasting = |e: &std::io::Error| {
+        use std::io::ErrorKind::{PermissionDenied, ReadOnlyFilesystem, Unsupported};
+        matches!(
+            e.kind(),
+            Unsupported | PermissionDenied | ReadOnlyFilesystem
+        )
+    };
+    let mut failing = false;
+    for _ in 0..TRIES {
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path);
+        failing = match opened {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(Error(e)) if lasting(&e) => return Err(Untaken::Unlockable),
+                Err(Error(_)) => true,
+                Err(WouldBlock) => match file.try_lock_shared() {
+                    // Shared too, it was held by looks alone.
+                    Ok(()) => {
+                        let _ = file.unlock();
+                        false
+                    }
+                    Err(WouldBlock) => return Err(Untaken::Held),
+                    Err(Error(e)) if lasting(&e) => return Err(Untaken::Unlockable),
+                    Err(Error(_)) => true,
+                },
+            },
+            Err(e) if lasting(&e) => return Err(Untaken::Unlockable),
+            Err(_) => true,
+        };
+        between();
+    }
+    Err(if failing {
+        Untaken::Unlockable
+    } else {
+        Untaken::Stuck
+    })
+}
+
+impl Drop for TurnHold {
+    fn drop(&mut self) {
+        let mut held = HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The word first, so the next holder's is never the one removed.
+        if let Some(file) = &self.file {
+            let _ = std::fs::remove_file(session_path(self.id).with_extension("who"));
+            let _ = file.unlock();
+        }
+        held.remove(&self.id);
+    }
+}
+
 /// Whether session `id` is surely not saved: a file that merely cannot be
 /// read now does not count, as its kept copies would go with the answer.
 fn gone(id: u64) -> bool {
@@ -3409,6 +3843,17 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
+/// `fill`, marking where the read stood in the file, as `filled_with_seen`
+/// does, for a copy whose turns catch up on what another process adds.
+pub fn fill_seen(conversation: &mut Conversation) {
+    if !conversation.unfilled() {
+        return;
+    }
+    if let Some((read, stood)) = messages_seen(conversation.id) {
+        conversation.filled_with_seen(read, stood);
+    }
+}
+
 /// A session's messages as its file has them, the summary saved of the
 /// first of them, the summaries the user asked for that still hold, and what
 /// Auto mode's judge made of its calls.
@@ -3423,7 +3868,26 @@ pub type Contents = (
 /// for filling it off the thread that holds it; None when the file cannot be
 /// read.
 pub fn messages(id: u64) -> Option<Contents> {
-    replay(&session_path(id)).map(|c| (c.messages, c.summary, c.asked, c.decisions))
+    messages_seen(id).map(|(contents, _)| contents)
+}
+
+/// Where a read of a session's file stood in it, and the descriptive
+/// fields it found there, for `filled_with_seen`.
+pub struct Stood {
+    seen: Option<Seen>,
+    meta: Meta,
+}
+
+/// `messages`, with where the read stood in the file, for
+/// `filled_with_seen`.
+pub fn messages_seen(id: u64) -> Option<(Contents, Stood)> {
+    replay(&session_path(id)).map(|c| {
+        let stood = Stood {
+            seen: c.seen,
+            meta: c.meta(),
+        };
+        ((c.messages, c.summary, c.asked, c.decisions), stood)
+    })
 }
 
 /// The settings as the file has them now.
@@ -4097,8 +4561,8 @@ pub(crate) mod tests {
     use super::write_private;
     use super::{
         ASIDE_STALE, Conversation, HITS_PER_SESSION, Judged, Lock, SNIPPET_SIDE, Store, Todo,
-        Transcript, Within, apply_todo, fill, load, load_listing, modified, replay, search,
-        search_in, search_through, summaries, todos_in,
+        Transcript, Within, apply_todo, fill, held_elsewhere, hold_turn, load, load_listing,
+        modified, replay, search, search_in, search_through, summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -5793,6 +6257,219 @@ pub(crate) mod tests {
         store.remove(0);
         assert!(!one.exists());
         assert!(!one.with_extension("lock").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// Session `id`'s turn held as another process holds it, under `who`:
+    /// through a file of its own, which this process's holds know nothing of.
+    fn held_by_another(id: u64, who: &str) -> std::fs::File {
+        let path = super::session_path(id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("turn"))
+            .unwrap();
+        file.lock().unwrap();
+        std::fs::write(path.with_extension("who"), who).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_second_hold_on_a_session_fails_and_says_who_holds_it() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-twice");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let held = hold_turn(1, "phone").unwrap();
+        assert_eq!(hold_turn(1, "window").err().as_deref(), Some("phone"));
+        // Another session's turn is its own.
+        assert!(hold_turn(2, "window").is_ok());
+        drop(held);
+
+        let other = held_by_another(1, "terminal");
+        assert_eq!(hold_turn(1, "window").err().as_deref(), Some("terminal"));
+        drop(other);
+        assert!(hold_turn(1, "window").is_ok());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn this_process_own_hold_is_not_held_elsewhere() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-own");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        assert_eq!(held_elsewhere(1), None);
+        let held = hold_turn(1, "window").unwrap();
+        assert_eq!(held_elsewhere(1), None);
+        drop(held);
+
+        let other = held_by_another(1, "phone");
+        assert_eq!(held_elsewhere(1).as_deref(), Some("phone"));
+        // Looking leaves it held, and a look's moment is no turn of its own.
+        assert_eq!(held_elsewhere(1).as_deref(), Some("phone"));
+        drop(other);
+        assert_eq!(held_elsewhere(1), None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_hold_is_let_go_when_dropped() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-drop");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = super::session_path(1);
+
+        let held = hold_turn(1, "terminal").unwrap();
+        assert!(held.held());
+        let word = std::fs::read_to_string(path.with_extension("who")).unwrap();
+        assert_eq!(word, "terminal");
+        drop(held);
+        // Another process can take it now, and nobody is named holding it.
+        let turn = std::fs::File::options()
+            .write(true)
+            .open(path.with_extension("turn"))
+            .unwrap();
+        assert!(turn.try_lock().is_ok());
+        assert!(!path.with_extension("who").exists());
+        drop(turn);
+        assert!(hold_turn(1, "window").is_ok());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_look_that_lasts_a_moment_is_waited_out_rather_than_taken_for_a_turn() {
+        let dir = scratch("turn-looks");
+        let path = dir.join("1.turn");
+        // Another process looking, as `held_elsewhere` does, until the take
+        // has tried once and been turned away by it.
+        let look = std::fs::File::create(&path).unwrap();
+        look.lock_shared().unwrap();
+        let mut look = Some(look);
+        let mut tries = 0;
+        let taken = super::take_turn(&path, || {
+            tries += 1;
+            look.take();
+        });
+        assert!(taken.is_ok());
+        assert_eq!(tries, 1);
+    }
+
+    #[test]
+    fn a_turn_file_that_fails_every_try_runs_the_turn_unheld_but_held_here() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-failing");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // A folder where the turn file goes fails every open, as a disk
+        // without locking fails every lock.
+        std::fs::create_dir_all(super::session_path(1).with_extension("turn")).unwrap();
+
+        let unheld = hold_turn(1, "terminal").unwrap();
+        assert!(!unheld.held());
+        // Still this process's own, so a second turn here waits for it.
+        assert_eq!(hold_turn(1, "window").err().as_deref(), Some("terminal"));
+        drop(unheld);
+        assert!(hold_turn(1, "window").is_ok_and(|held| !held.held()));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_written_runs_the_turn_unheld() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root writes where a folder's mode says it may not, so as root
+        // there is no such folder to try.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-read-only");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let unheld = hold_turn(1, "terminal");
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(unheld.is_ok_and(|held| !held.held()));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_background_run_holds_its_session_s_turn() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-background");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // What a `--bg` run holds for as long as it works.
+        std::fs::create_dir_all(dir.join("background")).unwrap();
+        let run = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("background/1.lock"))
+            .unwrap();
+        run.lock().unwrap();
+        assert_eq!(held_elsewhere(1).as_deref(), Some("background"));
+        assert_eq!(hold_turn(1, "window").err().as_deref(), Some("background"));
+        assert_eq!(held_elsewhere(2), None);
+        drop(run);
+        assert_eq!(held_elsewhere(1), None);
+        assert!(hold_turn(1, "window").is_ok());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_background_run_in_this_process_holds_its_own_session_s_turn() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-background-here");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let record = crate::background::Record {
+            session: 1,
+            ..Default::default()
+        };
+        let run = crate::background::Run::claim(record).unwrap();
+        assert_eq!(held_elsewhere(1), None);
+        assert!(hold_turn(1, "background").is_ok_and(|held| held.held()));
+        drop(run);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_a_turn_is_answering_in_is_not_removed() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-remove");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        for id in [1, 2] {
+            store.conversations.push(Conversation {
+                id,
+                messages: vec![said("user", "hello")],
+                ..Default::default()
+            });
+        }
+        store.save().unwrap();
+        let (one, two) = (super::session_path(1), super::session_path(2));
+
+        // Answering in another process, and in this one.
+        let other = held_by_another(2, "phone");
+        assert!(!store.remove(1));
+        let here = hold_turn(1, "window").unwrap();
+        assert!(!store.remove(0));
+        assert_eq!(store.conversations.len(), 2);
+        assert!(one.exists() && two.exists());
+        assert_eq!(super::session(2).unwrap().messages.len(), 1);
+
+        drop((other, here));
+        assert!(store.remove(1));
+        assert!(!two.exists() && !two.with_extension("turn").exists());
+        assert!(store.remove(0));
+        assert!(!one.exists() && !one.with_extension("turn").exists());
+        assert!(store.conversations.is_empty());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -7929,6 +8606,346 @@ pub(crate) mod tests {
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
+    /// `window_and_terminal`, with the terminal's copy filled as a copy
+    /// whose turns catch up is, knowing where it stands in the file.
+    fn window_and_marked_terminal(n: usize) -> (Store, Store) {
+        let (window, _) = window_and_terminal(n);
+        let mut terminal = load_listing();
+        super::fill_seen(&mut terminal.conversations[0]);
+        (window, terminal)
+    }
+
+    #[test]
+    fn catching_up_takes_in_a_turn_from_elsewhere_and_the_next_save_keeps_both() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_marked_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        // A turn in the terminal, which had nothing to catch up on.
+        let open = &mut terminal.conversations[0];
+        assert_eq!(open.catch_up(), Ok(false));
+        open.messages.push(said("user", "asked there"));
+        open.messages.push(said("assistant", "answered there"));
+        terminal.save().unwrap();
+
+        // Then one in the window, which starts from the file.
+        let open = &mut window.conversations[0];
+        assert_eq!(open.catch_up(), Ok(true));
+        assert_eq!(contents(open), ["0", "1", "asked there", "answered there"]);
+        open.messages.push(said("user", "asked here"));
+        open.messages.push(said("assistant", "answered here"));
+        window.save().unwrap();
+        assert!(!window.conversations[0].diverged);
+        let both = [
+            "0",
+            "1",
+            "asked there",
+            "answered there",
+            "asked here",
+            "answered here",
+        ];
+        assert_eq!(contents(&replay(&path).unwrap()), both);
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(!file.contains("\"rewind\""));
+
+        // And the terminal's next turn has the window's too.
+        let open = &mut terminal.conversations[0];
+        assert_eq!(open.catch_up(), Ok(true));
+        assert_eq!(contents(open), both);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rename_and_a_pin_made_elsewhere_during_a_turn_are_kept_by_its_save() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("turn-keeps-rename");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_marked_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        // The window's turn begins and changes its effort, then the terminal
+        // renames and pins the session while it runs.
+        let open = &mut window.conversations[0];
+        assert_eq!(open.catch_up(), Ok(false));
+        open.effort = Some("high".into());
+        open.messages.push(said("user", "asked here"));
+        terminal.conversations[0].title = "renamed there".into();
+        terminal.conversations[0].pinned = true;
+        terminal.save().unwrap();
+        window.conversations[0]
+            .messages
+            .push(said("assistant", "answered here"));
+        window.save().unwrap();
+
+        let open = &window.conversations[0];
+        assert!(!open.diverged);
+        let back = replay(&path).unwrap();
+        for copy in [open, &back] {
+            assert_eq!(copy.title, "renamed there");
+            assert!(copy.pinned);
+            assert_eq!(copy.effort.as_deref(), Some("high"));
+            assert_eq!(contents(copy), ["0", "asked here", "answered here"]);
+        }
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"rewind\"")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rename_made_elsewhere_before_a_fill_is_kept_by_the_next_save() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fill-renamed");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut first = Store::default();
+        first.conversations.push(numbered(1));
+        first.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+
+        // Listed here, then renamed and pinned elsewhere before it is read.
+        let mut here = load_listing();
+        let mut there = load();
+        there.conversations[0].title = "renamed there".into();
+        there.conversations[0].pinned = true;
+        there.save().unwrap();
+        here.conversations[0].effort = Some("high".into());
+        super::fill_seen(&mut here.conversations[0]);
+
+        // A turn here keeps what was done there and what was changed here.
+        let open = &mut here.conversations[0];
+        assert_eq!(open.title, "renamed there");
+        assert_eq!(open.catch_up(), Ok(false));
+        open.messages.push(said("user", "asked here"));
+        here.save().unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.title, "renamed there");
+        assert!(back.pinned);
+        assert_eq!(back.effort.as_deref(), Some("high"));
+        assert_eq!(contents(&back), ["0", "asked here"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_summary_made_elsewhere_is_followed_after_a_save_here() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-summary");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_marked_terminal(2);
+
+        // Summed up in the terminal, then renamed in the window.
+        terminal.conversations[0].summarized(1, "the first of it".into());
+        terminal.save().unwrap();
+        window.conversations[0].title = "renamed here".into();
+        window.save().unwrap();
+        window.follow(|_| false);
+        let open = &window.conversations[0];
+        assert_eq!(open.summary, Some((1, "the first of it".to_owned())));
+        assert_eq!(open.title, "renamed here");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn catching_up_keeps_a_model_picked_here_and_not_saved_yet() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up-pick");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0]
+            .messages
+            .push(said("assistant", "from the terminal"));
+        terminal.conversations[0].title = "named there".into();
+        terminal.save().unwrap();
+        let open = &mut window.conversations[0];
+        open.gateway = Some("Letronna".into());
+        open.model = Some("picked here".into());
+        assert_eq!(open.catch_up(), Ok(true));
+        assert_eq!(contents(open), ["0", "from the terminal"]);
+        let kept = |c: &Conversation| (c.title.clone(), c.model.clone());
+        let both = ("named there".to_owned(), Some("picked here".to_owned()));
+        assert_eq!(kept(open), both);
+        window.save().unwrap();
+        assert!(!window.conversations[0].diverged);
+        assert_eq!(kept(&replay(&path).unwrap()), both);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_model_is_laid_over_with_its_gateway_and_a_folder_with_its_worktree() {
+        let then = super::Meta {
+            model: Some("first".into()),
+            gateway: Some("Letronna".into()),
+            workspace: Some("/work".into()),
+            ..Default::default()
+        };
+        // The other process moved the folder; this copy picked a model on
+        // another gateway that happens to name the same model there.
+        let theirs = super::Meta {
+            model: Some("second".into()),
+            gateway: Some("Custom".into()),
+            workspace: Some("/work/tree".into()),
+            worktree: Some(crate::worktree::Worktree {
+                path: "/work/tree".into(),
+                branch: "session-1".into(),
+                base: "abc".into(),
+                prefix: String::new(),
+                checkout: Some("/work".into()),
+            }),
+            ..then.clone()
+        };
+        let mine = super::Meta {
+            gateway: Some("OpenRouter".into()),
+            ..then.clone()
+        };
+        let laid = super::laid_over(theirs, &then, mine);
+        let model = (laid.model.as_deref(), laid.gateway.as_deref());
+        assert_eq!(model, (Some("first"), Some("OpenRouter")));
+        assert_eq!(
+            laid.workspace.as_deref(),
+            Some(std::path::Path::new("/work/tree"))
+        );
+        assert!(laid.worktree.is_some());
+    }
+
+    #[test]
+    fn a_transcript_catches_up_on_its_file_too() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up-transcript");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (_, mut terminal) = window_and_terminal(1);
+        let path = super::session_path(1);
+        let mut transcript = Transcript {
+            conversation: replay(&path).unwrap(),
+            path,
+        };
+
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "from the terminal"));
+        terminal.save().unwrap();
+        assert_eq!(transcript.catch_up(), Ok(true));
+        assert_eq!(
+            contents(&transcript.conversation),
+            ["0", "from the terminal"]
+        );
+        // One kept in memory only has no file to catch up on.
+        let mut aside = Transcript {
+            path: std::path::PathBuf::new(),
+            conversation: numbered(1),
+        };
+        assert_eq!(aside.catch_up(), Ok(false));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn catching_up_on_a_session_deleted_elsewhere_says_so() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up-deleted");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(1);
+
+        std::fs::remove_file(dir.join("sessions/1.jsonl")).unwrap();
+        assert!(window.conversations[0].catch_up().is_err());
+        // A session never saved has nothing in a file to miss.
+        let mut new = numbered(1);
+        new.id = 2;
+        assert_eq!(new.catch_up(), Ok(false));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn catching_up_after_the_id_went_to_another_session_says_it_was_deleted() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up-reused");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(2);
+
+        // Deleted elsewhere, and its id given to a session started there.
+        std::fs::remove_file(dir.join("sessions/1.jsonl")).unwrap();
+        let mut terminal = Store::default();
+        terminal.conversations.push(Conversation {
+            id: 1,
+            title: "another".into(),
+            updated: 5,
+            messages: vec![said("user", "not yours")],
+            ..Default::default()
+        });
+        terminal.save().unwrap();
+
+        let open = &mut window.conversations[0];
+        assert!(open.catch_up().is_err());
+        assert!(open.gone);
+        assert_eq!(contents(open), ["0", "1"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn catching_up_with_something_unsaved_refuses_once_the_file_moved() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("catch-up-unsaved");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_marked_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        // Said here, its save not made yet: nothing else is in the file, so
+        // the next save writes it as it is.
+        let open = &mut window.conversations[0];
+        open.messages.push(said("user", "not saved yet"));
+        assert_eq!(open.catch_up(), Ok(false));
+
+        // Once a turn elsewhere is in the file, neither is cut for the other.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "said there"));
+        terminal.save().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let open = &mut window.conversations[0];
+        assert!(open.catch_up().is_err());
+        assert_eq!(contents(open), ["0", "not saved yet"]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn only_a_copy_read_to_catch_up_knows_where_it_stands_in_its_file() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fill-seen");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (window, marked) = window_and_marked_terminal(2);
+
+        // Filled as before, saved blind as before.
+        let mut plain = load_listing();
+        fill(&mut plain.conversations[0]);
+        assert!(plain.conversations[0].seen.is_none());
+        let read = &marked.conversations[0];
+        assert!(read.seen.is_some());
+        assert!(read.seen == window.conversations[0].seen);
+        // Filled off the thread that holds it, as the window does.
+        let mut listing = load_listing();
+        let (contents, seen) = super::messages_seen(1).unwrap();
+        listing.conversations[0].filled_with_seen(contents, seen);
+        assert!(listing.conversations[0].seen == read.seen);
+
+        // One started here knows once it has caught up and been saved.
+        let mut store = Store::default();
+        store.conversations.push(numbered(1));
+        store.conversations[0].id = 2;
+        store.save().unwrap();
+        assert!(store.conversations[0].seen.is_none());
+        let mut started = Store::default();
+        started.conversations.push(numbered(1));
+        started.conversations[0].id = 3;
+        assert_eq!(started.conversations[0].catch_up(), Ok(false));
+        started.save().unwrap();
+        assert!(started.conversations[0].seen.is_some());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
     #[test]
     fn a_goal_checks_calls_count_in_usage_without_what_it_said() {
         let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
@@ -8463,6 +9480,24 @@ pub(crate) mod tests {
         assert!(super::prune(30, now, &[]).is_empty());
         assert!(path.exists() && path.with_extension("lock").exists());
         drop(held);
+        assert_eq!(super::prune(30, now, &[]), [1]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_a_turn_is_answering_in_is_not_pruned() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune-turn");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 40, now);
+        saved_days_ago(&mut store, 2, 5, now);
+        let answering = held_by_another(1, "phone");
+        assert!(super::prune(30, now, &[]).is_empty());
+        assert!(super::session_path(1).exists());
+        drop(answering);
         assert_eq!(super::prune(30, now, &[]), [1]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }

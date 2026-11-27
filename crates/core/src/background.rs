@@ -38,6 +38,14 @@ const STOP_GAP: Duration = Duration::from_secs(1);
 /// night, and its files are then removed.
 const KEPT: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How many times a claim of a run is tried again past looks that share its
+/// lock for a moment, `LOOK_GAP` apart: a look is a few system calls long,
+/// so the tries outlast any run of them.
+const LOOKS: usize = 40;
+
+/// How long a claim waits between those tries.
+const LOOK_GAP: Duration = Duration::from_millis(2);
+
 /// How much of the run's answer its record keeps: a line or two, for the
 /// list; the whole answer is in the session.
 const SAID_CHARS: usize = 300;
@@ -171,6 +179,15 @@ pub struct Run {
     _lock: std::fs::File,
 }
 
+impl Drop for Run {
+    fn drop(&mut self) {
+        let session = self.lock().session;
+        OURS.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session);
+    }
+}
+
 impl Run {
     /// Take on session `record.session` as this process's background run,
     /// or say why not: another run of it is going.
@@ -187,15 +204,26 @@ impl Run {
             .truncate(false)
             .open(path(dir, id, "lock"))
             .map_err(|e| format!("Cannot start session {id} in the background: {e}"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(format!(
-                    "Session {id} is already working in the background: letronna attach {id} to watch it."
-                ));
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("Cannot start session {id} in the background: {e}"));
+        let mut tries = 0;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                // A look from `held` shares it for a moment, which is no run.
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tries < LOOKS && lock.try_lock_shared().is_ok() =>
+                {
+                    let _ = lock.unlock();
+                    tries += 1;
+                    std::thread::sleep(LOOK_GAP);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "Session {id} is already working in the background: letronna attach {id} to watch it."
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!("Cannot start session {id} in the background: {e}"));
+                }
             }
         }
         // What an earlier run of the session left is not for this one.
@@ -213,6 +241,9 @@ impl Run {
             _lock: lock,
         };
         run.save();
+        OURS.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
         Ok(run)
     }
 
@@ -402,6 +433,17 @@ pub fn running(session: u64) -> bool {
     held(&dir(), session)
 }
 
+/// The sessions whose background run is this process, so holding one's
+/// turn here is not refused as a run elsewhere.
+static OURS: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether this process is the background run of session `session`.
+pub(crate) fn ours(session: u64) -> bool {
+    OURS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&session)
+}
+
 fn held(dir: &Path, session: u64) -> bool {
     let Ok(lock) = std::fs::OpenOptions::new()
         .write(true)
@@ -409,7 +451,8 @@ fn held(dir: &Path, session: u64) -> bool {
     else {
         return false;
     };
-    match lock.try_lock() {
+    // Shared, so two looks at once never take each other for a run.
+    match lock.try_lock_shared() {
         Ok(()) => {
             let _ = lock.unlock();
             false
