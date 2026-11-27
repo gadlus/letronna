@@ -72,7 +72,12 @@ impl Chat {
             );
             return;
         }
-        self.put_files_back(session, plan, true, window, cx);
+        // Held while the files go back and the model is told.
+        let held = match self.hold_open("restore it once it is done") {
+            Ok(held) => held,
+            Err(why) => return self.toast(why, crate::ui::toast::Kind::Warning, cx),
+        };
+        self.put_files_back(session, plan, true, held, window, cx);
     }
 
     pub(crate) fn checkpoints_tab(&self, cx: &mut Context<Self>) -> AnyElement {

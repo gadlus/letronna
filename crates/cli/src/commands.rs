@@ -5282,11 +5282,9 @@ fn pick_up(
     index: usize,
 ) {
     let id = runner.store.conversations[index].id;
-    if letronna_core::background::running(id) {
-        render::blank();
-        render::line(&render::dim(&crate::background::busy(id)));
-        return;
-    }
+    // Answered elsewhere now, it opens to read, and says so; each line is
+    // refused until that turn ends.
+    let answering = letronna_core::store::held_elsewhere(id);
     *session = index;
     runner.enter(index);
     // A session carries its own project folder; one that never had a folder
@@ -5304,14 +5302,24 @@ fn pick_up(
     // was taken from, and saying it twice reads as the command having run
     // twice.
     replay(runner, index);
+    if let Some(who) = answering {
+        render::line(&render::dim(&crate::background::held(id, &who)));
+    }
     runner.recap_if_due(index);
     // Notices that came for it while another session was open rang for that
     // one, so they are taken now; and a turn stopped over there is no reason
     // for this one to stay quiet.
     runner.stopped = false;
+    // Unless another Letronna is answering in it, when they wait for its
+    // next turn here.
+    let Ok(_turn) = runner.hold_turn(index, "terminal") else {
+        return;
+    };
     if let Err(error) = runner.resume(index) {
         runner.show_failure(&error);
     }
+    // Saved before the turn is let go of.
+    runner.persist();
 }
 
 /// What changed in the project since its last commit, or with `session`

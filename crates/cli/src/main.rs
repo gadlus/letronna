@@ -382,6 +382,19 @@ fn main() {
             eprintln!("{}", render::red(&error));
         }
     }
+    // A session another Letronna is answering in -- the window, a phone, a
+    // run in the background -- takes no turn here until that one ends: a
+    // script is told so and stops, and a terminal opens it to read, saying
+    // so, and refuses each line meanwhile.
+    let answering = (args.background.is_none())
+        .then(|| store::held_elsewhere(runner.store.conversations[session].id))
+        .flatten()
+        .map(|who| background::held(runner.store.conversations[session].id, &who));
+    if let Some(why) = answering.clone().filter(|_| args.once()) {
+        runner.store.release_unused();
+        show(args.output, &failed(why), None, false);
+        std::process::exit(1);
+    }
     if let Some(name) = &args.name {
         runner.store.conversations[session].title = name.clone();
         runner.persist();
@@ -403,13 +416,6 @@ fn main() {
     // The one it opened with, whose worktree is seen to on the way out
     // even when another session is open by then.
     let opened = runner.store.conversations[session].id;
-    // A run in the background writes that session already, and a second
-    // writer would put their turns in among each other's.
-    if args.background.is_none() && letronna_core::background::running(opened) {
-        runner.store.release_unused();
-        show(args.output, &failed(background::busy(opened)), None, false);
-        std::process::exit(1);
-    }
     choose_by_flags(&mut runner, session, gateway, &args, routed);
     letronna_core::diag::mark("session");
 
@@ -497,6 +503,9 @@ fn main() {
     runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     render::clear();
     banner(&runner, &folder, session);
+    if let Some(why) = &answering {
+        render::line(&render::dim(why));
+    }
     // Plugins whose status shows from the start start now, off this thread.
     letronna_core::plugins::code::init();
     let (on, model) = runner.store.model(session);
@@ -605,11 +614,8 @@ fn main() {
             // loop's tick is the user's standing order, which a stop does
             // not hold back, or the loop would stall until they typed.
             let id = runner.store.conversations[session].id;
-            if (!runner.stopped || letronna_core::wake::waiting(id))
-                && let Err(error) = runner.resume(session)
-            {
-                runner.show_failure(&error);
-                screen::settle();
+            if !runner.stopped || letronna_core::wake::waiting(id) {
+                resume_held(&mut runner, session);
             }
             continue;
         };
@@ -686,6 +692,20 @@ fn main() {
             screen::settle();
             continue;
         }
+        // Held from before the prompt goes in until the turn is saved, and
+        // after what was said here elsewhere meanwhile, which shows first.
+        let had = runner.store.conversations[session].messages.len();
+        let turn = match runner.hold_turn(session, "terminal") {
+            Ok(turn) => turn,
+            Err(error) => {
+                runner.show_failure(&error);
+                // Kept as typed, to send once that turn is done.
+                runner.bar.say(&line);
+                screen::settle();
+                continue;
+            }
+        };
+        show_caught_up(&runner, session, had);
         let id = runner.store.conversations[session].id;
         for notice in crew::prompt(id, &line, crew::Source::Bar) {
             inbox::push(id, notice);
@@ -704,6 +724,7 @@ fn main() {
             }
         }
         runner.persist();
+        drop(turn);
         if runner.bar.finished() {
             break;
         }
@@ -747,6 +768,34 @@ fn main() {
         render::line(&render::dim(kept));
     }
     letronna_core::diag::stop();
+}
+
+/// Run a turn on the notices waiting for idle session `session`, unless
+/// another Letronna is answering in it, when they wait for the next turn.
+fn resume_held(runner: &mut Runner, session: usize) {
+    let had = runner.store.conversations[session].messages.len();
+    let Ok(_turn) = runner.hold_turn(session, "terminal") else {
+        return;
+    };
+    show_caught_up(runner, session, had);
+    if let Err(error) = runner.resume(session) {
+        runner.show_failure(&error);
+        screen::settle();
+    }
+    // Saved before the turn is let go of.
+    runner.persist();
+}
+
+/// Show what catching up took into session `session` past the `had`
+/// messages this terminal showed: what was said in it elsewhere meanwhile.
+fn show_caught_up(runner: &Runner, session: usize, had: usize) {
+    let messages = &runner.store.conversations[session].messages;
+    if messages.len() <= had {
+        return;
+    }
+    render::blank();
+    render::line(&render::dim("Said in this session elsewhere meanwhile:"));
+    banner::replay_from(messages, had);
 }
 
 /// The open session's folder, its worktree among them, else `start`, the
@@ -898,6 +947,19 @@ fn ask_once(
     let title = match runner.store.conversations[session].title.trim() {
         "" => crate::session::first_line(prompt),
         title => title.to_owned(),
+    };
+    // Held from before the prompt goes on the session until it is saved,
+    // and from the session as its file has it now.
+    let who = match ran {
+        Some(_) => "background",
+        None => "terminal",
+    };
+    let _turn = match runner.hold_turn(session, who) {
+        Ok(turn) => turn,
+        Err(error) => {
+            show(args.output, &failed(error), None, false);
+            return false;
+        }
     };
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
@@ -1225,7 +1287,8 @@ fn take_back(runner: &mut Runner, session: usize, id: u64, before: usize) -> Opt
     let mut listing = store::load_listing();
     let index = listing.index_of(id)?;
     let mut conversation = listing.conversations.remove(index);
-    store::fill(&mut conversation);
+    // Knowing where it stands in the file, as its next turn catches up.
+    store::fill_seen(&mut conversation);
     let said = said_last(conversation.messages.get(before..)?);
     conversation.updated = chat::now();
     runner.store.conversations.insert(session, conversation);

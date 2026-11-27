@@ -322,6 +322,10 @@ pub(crate) struct Chat {
     pub(crate) call_running: bool,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
+    /// The turn of the session a reply runs in, held from before its prompt
+    /// goes in until its end is saved, so no other Letronna answers there
+    /// meanwhile.
+    pub(crate) turn_hold: Option<(u64, letronna_core::store::TurnHold)>,
     /// The id of the queued call the approval card is up for, decided once
     /// when the queue stopped on it.
     pub(crate) asking: Option<String>,
@@ -1128,6 +1132,7 @@ impl Chat {
             review: Default::default(),
             call_running: false,
             streaming_id: None,
+            turn_hold: None,
             asking: None,
             card_for: None,
             offer: None,
@@ -1528,9 +1533,9 @@ impl Chat {
         }
         let read = cx
             .background_executor()
-            .spawn(async move { letronna_core::store::messages(id) });
+            .spawn(async move { letronna_core::store::messages_seen(id) });
         cx.spawn(async move |this, cx| {
-            let Some(messages) = read.await else {
+            let Some((messages, stood)) = read.await else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
@@ -1538,7 +1543,7 @@ impl Chat {
                 let Some(ix) = this.store.index_of(id).filter(|_| this.open.contains(&id)) else {
                     return;
                 };
-                this.store.conversations[ix].filled_with(messages);
+                this.store.conversations[ix].filled_with_seen(messages, stood);
                 cx.notify();
             });
         })
@@ -1551,11 +1556,54 @@ impl Chat {
         if !conversation.unfilled() {
             return;
         }
-        letronna_core::store::fill(conversation);
+        letronna_core::store::fill_seen(conversation);
         // First in line to be let go of again, unless it is opened.
         let id = conversation.id;
         if !self.open.contains(&id) {
             self.open.push_back(id);
+        }
+    }
+
+    /// Hold session `ix`'s turn for the window and take in what was said in
+    /// it elsewhere meanwhile, so what follows starts from its file, and say
+    /// whether anything was; or say who is answering there, ending with
+    /// `then`.
+    pub(crate) fn hold_session(
+        &mut self,
+        ix: usize,
+        then: &str,
+    ) -> Result<(letronna_core::store::TurnHold, bool), String> {
+        let conversation = &mut self.store.conversations[ix];
+        let id = conversation.id;
+        let held = letronna_core::store::hold_turn(id, "window")
+            .map_err(|who| answering_elsewhere(&who, then))?;
+        let caught = conversation.catch_up()?;
+        Ok((held, caught))
+    }
+
+    /// `hold_session` for the window's own turn, kept in `turn_hold` until
+    /// the turn ends; a follow-up there keeps the hold its turn had.
+    pub(crate) fn hold_turn(&mut self, ix: usize, then: &str) -> Result<bool, String> {
+        let id = self.store.conversations[ix].id;
+        if (self.turn_hold.as_ref()).is_some_and(|(held, _)| *held == id) {
+            return self.store.conversations[ix].catch_up();
+        }
+        // The last turn's, in another session, goes once all of it is saved.
+        if self.turn_hold.is_some() {
+            self.save();
+            self.turn_hold = None;
+        }
+        let (held, caught) = self.hold_session(ix, then)?;
+        self.turn_hold = Some((id, held));
+        Ok(caught)
+    }
+
+    /// Let go of the turn `turn_hold` holds once all of it is saved, unless
+    /// a reply runs in that session now.
+    pub(crate) fn release_turn(&mut self) {
+        if (self.turn_hold.as_ref()).is_some_and(|(id, _)| self.streaming_id != Some(*id)) {
+            self.save();
+            self.turn_hold = None;
         }
     }
 
@@ -1685,6 +1733,14 @@ impl Chat {
                     self.error = Some(why);
                 }
             }
+            cx.notify();
+            return;
+        }
+        // A turn another Letronna is answering here, on the phone or in a
+        // terminal, writes this session too. Kept as typed, to send once it
+        // is done.
+        if let Some(who) = letronna_core::store::held_elsewhere(here) {
+            self.error = Some(answering_elsewhere(&who, SEND_AGAIN));
             cx.notify();
             return;
         }
@@ -1948,6 +2004,9 @@ impl Chat {
                             this.dispatch(text, images, None, cx)
                         };
                         if sent.is_err() {
+                            // Not sent, so not lost: the box keeps it.
+                            this.composer
+                                .update(cx, |input, cx| input.set_value(typed, window, cx));
                             this.not_sent(window, cx);
                         } else {
                             this.attachments.remove(&session);
@@ -2223,6 +2282,15 @@ impl Chat {
                 return Err(());
             }
         };
+        // Before anything is said, so no other Letronna answers here
+        // meanwhile and the turn starts from the session's file.
+        if let Err(why) = self.hold_turn(self.store.active, SEND_AGAIN) {
+            self.error = Some(why);
+            cx.notify();
+            return Err(());
+        }
+        // Files put back while another Letronna answered here, told now.
+        self.tell_waiting_put_back(self.store.conversations[self.store.active].id);
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
         // What is still being said of the last answer is not wanted now, but
@@ -2830,6 +2898,11 @@ impl Chat {
     /// up, unless it was held back for want of a subscription, which the
     /// picker and the box say already.
     pub(crate) fn not_sent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Answering elsewhere, which the error says and Settings cannot help.
+        let here = self.store.conversations[self.store.active].id;
+        if letronna_core::store::held_elsewhere(here).is_some() {
+            return;
+        }
         if self.upgrade_needed_here() {
             self.error = None;
             self.open_model_picker(window, cx);
@@ -3084,6 +3157,15 @@ impl Chat {
             loop {
                 if pacer.is_empty() {
                     if !open {
+                        // Closed with no end said, as a call that panicked
+                        // leaves it: the turn ends here, or it would hold
+                        // the session for ever.
+                        let _ = this.update(cx, |this, cx| {
+                            if this.generation == generation && this.turn.is_some() {
+                                this.error = Some("The reply stopped without finishing.".into());
+                                this.finish(cx);
+                            }
+                        });
                         break;
                     }
                     match receiver.recv().await {
@@ -4688,6 +4770,9 @@ impl Chat {
         {
             self.error = Some(format!("Not read aloud: {why}"));
         }
+        // The session's turn goes once all of it is saved, unless the next
+        // turn there has started already.
+        self.release_turn();
         cx.notify();
     }
 
@@ -4764,7 +4849,14 @@ impl Chat {
         let Some(ix) = self.store.index_of(id).filter(|_| !self.busy) else {
             return cx.notify();
         };
+        // Held before the goal is saved; with another Letronna answering
+        // there now, the goal stays as it was, to be looked at again after
+        // the session's next turn here.
+        if self.hold_turn(ix, "this turn did not start").is_err() {
+            return cx.notify();
+        }
         if !goal::settle(&mut self.store.conversations[ix].goal, judged, &step) {
+            self.release_turn();
             return self.wake_idle(cx);
         }
         self.save();
@@ -4779,9 +4871,13 @@ impl Chat {
             | goal::Step::Pause { notice, .. }
             | goal::Step::Deferred(notice) => {
                 self.note = Some(notice);
+                self.release_turn();
                 self.wake_idle(cx);
             }
-            goal::Step::Cleared => self.wake_idle(cx),
+            goal::Step::Cleared => {
+                self.release_turn();
+                self.wake_idle(cx);
+            }
         }
         cx.notify();
     }
@@ -4844,16 +4940,28 @@ impl Chat {
         // in its session would answer nobody; its next message takes them. A
         // scheduled run going on here reads its own as it goes, and a run
         // beside the chat reads its session's own before it answers.
+        // Nor one another Letronna is answering in, whose notices wait.
         let wakes = |id| {
             self.store.index_of(id).is_some()
                 && !self.remote.holds(id)
                 && letronna_core::schedule::running(id).is_none()
                 && !self.runs.contains_key(&id)
+                && letronna_core::store::held_elsewhere(id).is_none()
         };
         let Some(id) = woken(on_screen, &inbox::pending(), wakes) else {
             return;
         };
+        // Held before the notices are taken, which stay waiting for the next
+        // ring when another Letronna has started answering there meanwhile.
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        self.fill_now(ix);
+        if self.hold_turn(ix, "this turn did not start").is_err() {
+            return;
+        }
         let Some(notice) = inbox::fold(&inbox::take(id, true)) else {
+            self.release_turn();
             return;
         };
         self.start_in(id, notice, cx);
@@ -4864,10 +4972,19 @@ impl Chat {
         let Some(ix) = self.store.index_of(id) else {
             return;
         };
-        // Kept even when no turn can start, so the next prompt there reads
-        // it rather than it being lost. After what was said before, which a
-        // session let go of has to be read back for.
+        // Kept even when no turn can start for want of a connection, so the
+        // next prompt there reads it rather than it being lost. After what
+        // was said before, which a session let go of has to be read back
+        // for, here and elsewhere. Another Letronna answering there now
+        // would have it saved over its turn, so then it is left out: a
+        // notice waits for that in `wake_idle`, and a goal is looked at
+        // again after the session's next turn here.
         self.fill_now(ix);
+        if let Err(why) = self.hold_turn(ix, "this turn did not start") {
+            self.error = Some(self.naming(id, why));
+            cx.notify();
+            return;
+        }
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
         conversation.messages.push(notice);
@@ -4876,12 +4993,25 @@ impl Chat {
         let connection = match self.connection_for(ix, None) {
             Ok(connection) => connection,
             Err(error) => {
+                self.release_turn();
                 self.error = Some(error);
                 cx.notify();
                 return;
             }
         };
         self.begin_turn(id, connection, cx);
+    }
+
+    /// `why`, said of session `id`, with the session named when it is not
+    /// the one on screen, which "this session" would be taken for.
+    fn naming(&self, id: u64, why: String) -> String {
+        let on_screen = self.store.conversations.get(self.store.active);
+        match self.store.index_of(id) {
+            Some(ix) if on_screen.is_none_or(|open| open.id != id) => {
+                format!("\"{}\": {why}", self.store.conversations[ix].shown_title())
+            }
+            _ => why,
+        }
     }
 
     /// Ask again in the session `id` where its last turn failed, carrying on
@@ -4915,6 +5045,13 @@ impl Chat {
 
     /// Run a turn in the session `id` on what it already holds.
     fn begin_turn(&mut self, id: u64, mut connection: Connection, cx: &mut Context<Self>) {
+        if let Some(ix) = self.store.index_of(id)
+            && let Err(why) = self.hold_turn(ix, "this turn did not start")
+        {
+            self.error = Some(self.naming(id, why));
+            cx.notify();
+            return;
+        }
         self.busy = true;
         self.streaming_id = Some(id);
         // What the user asked for, for the judge, as `run_turn` keeps it.
@@ -5715,6 +5852,24 @@ fn background_busy(id: u64) -> String {
     )
 }
 
+/// What a refused send says the user can do about it.
+pub(crate) const SEND_AGAIN: &str = "send again once it is done";
+
+/// Why the window cannot answer in a session now: `who`, as
+/// `store::held_elsewhere` words it, is answering there in another
+/// Letronna. `then` says what the user can do once that turn is done.
+pub(crate) fn answering_elsewhere(who: &str, then: &str) -> String {
+    let place = match who {
+        "phone" => "on your phone",
+        "terminal" => "in a terminal",
+        "editor" => "in an editor",
+        "background" => "in the background",
+        "window" => "in another window",
+        _ => "elsewhere",
+    };
+    format!("This session is answering {place} now; {then}.")
+}
+
 /// What an added command gives.
 pub(crate) enum Given {
     /// Text for the composer, read before it is sent.
@@ -5743,8 +5898,9 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        background_busy, card_is_up, cuts_in, escape_closes_aside, first_line, front_call,
-        name_after, run_ended, running_calls, side_question, until_repeated_id, untouched,
+        SEND_AGAIN, answering_elsewhere, background_busy, card_is_up, cuts_in, escape_closes_aside,
+        first_line, front_call, name_after, run_ended, running_calls, side_question,
+        until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
@@ -6043,5 +6199,19 @@ mod tests {
         let said = background_busy(42);
         assert!(said.contains("letronna attach 42"), "{said}");
         assert!(said.contains("letronna stop 42"), "{said}");
+    }
+
+    #[test]
+    fn a_session_answering_elsewhere_says_where() {
+        assert_eq!(
+            answering_elsewhere("phone", SEND_AGAIN),
+            "This session is answering on your phone now; send again once it is done."
+        );
+        let terminal = answering_elsewhere("terminal", "rewind once it is done");
+        assert_eq!(
+            terminal,
+            "This session is answering in a terminal now; rewind once it is done."
+        );
+        assert!(answering_elsewhere("", SEND_AGAIN).contains("answering elsewhere now"));
     }
 }

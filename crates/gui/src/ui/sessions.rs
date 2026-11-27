@@ -701,13 +701,19 @@ impl Chat {
     }
 
     /// Why session `id` cannot be deleted yet, if it cannot.
-    pub(crate) fn why_not_delete(&self, id: u64) -> Option<&'static str> {
-        delete_refusal(
+    pub(crate) fn why_not_delete(&self, id: u64) -> Option<String> {
+        let here = delete_refusal(
             id,
             self.streaming_id.filter(|_| self.busy),
             self.compacting.contains(&id),
             self.runs.contains_key(&id),
-        )
+        );
+        // Nor while another Letronna answers there, whose turn would go on
+        // into a session no longer there.
+        here.map(str::to_owned).or_else(|| {
+            letronna_core::store::held_elsewhere(id)
+                .map(|who| crate::app::answering_elsewhere(&who, "delete it once it is done"))
+        })
     }
 
     /// Ask, then delete the session at `index`. Said in a toast when it
@@ -753,6 +759,18 @@ impl Chat {
             .and_then(|_| beside(&self.listed_sessions(cx), index))
             .map(|i| self.store.conversations[i].id);
         let on_screen = self.store.conversations[self.store.active].id;
+        // Through the store first, so the session's file goes too, and what
+        // is kept beside it; one a turn is answering in stays, and so does
+        // all that goes with it here.
+        if !self.store.remove(index) {
+            let why = match letronna_core::store::held_elsewhere(id) {
+                Some(who) => crate::app::answering_elsewhere(&who, "delete it once it is done"),
+                None => "This window is answering in this session; delete it once it is done."
+                    .to_owned(),
+            };
+            window.push_notification(Notification::warning(why), cx);
+            return;
+        }
         self.stop_review(id);
         letronna_core::browser::forget(id);
         self.drafts.remove(&id);
@@ -796,9 +814,6 @@ impl Chat {
         {
             self.session_press = None;
         }
-        // Through the store, so the session's file goes too, and what is
-        // kept beside it.
-        self.store.remove(index);
         if self.store.conversations.is_empty() {
             self.picked = None;
             self.new_chat(window, cx);

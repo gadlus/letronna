@@ -201,6 +201,20 @@ pub fn busy(id: u64) -> String {
     )
 }
 
+/// Why session `id` cannot be opened or answer here now: `who`, as
+/// `store::held_elsewhere` words it, is answering in it in another Letronna.
+pub fn held(id: u64, who: &str) -> String {
+    let place = match who {
+        "background" => return busy(id),
+        "window" => "in the window",
+        "phone" => "on your phone",
+        "editor" => "in an editor",
+        "terminal" => "in another terminal",
+        _ => "elsewhere",
+    };
+    format!("Session {id} is answering {place} now; try again once it is done.")
+}
+
 /// Take on session `session`'s run in this process, as `--background`
 /// starts it with `token`, to do `prompt`.
 pub fn claim(

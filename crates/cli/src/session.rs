@@ -16,7 +16,7 @@ use letronna_core::notify::{self, Why};
 use letronna_core::permissions::Rule;
 use letronna_core::review;
 use letronna_core::speech::{self, Voice};
-use letronna_core::store::{Conversation, Judged, Store};
+use letronna_core::store::{self, Conversation, Judged, Store};
 use letronna_core::wake;
 use letronna_core::{goal, hooks, judge, permissions, tools};
 use std::sync::mpsc;
@@ -254,6 +254,18 @@ impl Runner {
                 Ok(Box::new(speech::System) as Box<dyn speech::Output>)
             }))
         });
+    }
+
+    /// Hold session `session`'s turn for this process as `who` and take in
+    /// what was said in it elsewhere since, so the turn starts from its
+    /// file; or say who is answering there.
+    pub fn hold_turn(&mut self, session: usize, who: &str) -> Result<store::TurnHold, String> {
+        let conversation = &mut self.store.conversations[session];
+        let id = conversation.id;
+        let held =
+            store::hold_turn(id, who).map_err(|holder| crate::background::held(id, &holder))?;
+        conversation.catch_up()?;
+        Ok(held)
     }
 
     /// Send one prompt and run the agent to completion. Returns the final
@@ -1904,7 +1916,8 @@ impl Runner {
         review::stop(&self.review);
         self.store.active = index;
         if let Some(conversation) = self.store.conversations.get_mut(index) {
-            letronna_core::store::fill(conversation);
+            // Knowing where it stands in the file, so its turns catch up.
+            letronna_core::store::fill_seen(conversation);
             self.bar.set_plan(&conversation.todos);
             self.bar
                 .set_history(&conversation.messages, conversation.workspace.as_deref());
